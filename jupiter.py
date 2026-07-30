@@ -52,6 +52,20 @@ async def get_price(s, mint):
     return (C.PROBE_SOL) / (out / 10 ** decimals)
 
 
+async def position_value_sol(s, mint, raw_amount):
+    """What you'd actually receive for selling THIS bag right now, in SOL.
+
+    More honest than pricing off a fixed probe: it includes the price impact of
+    your own size, which is the number that matters when you're deciding whether
+    to take profit. Returns None if there's no route.
+    """
+    if raw_amount <= 0:
+        return None
+    q = await quote(s, mint, WSOL, int(raw_amount))
+    out = int(q.get("outAmount", 0) or 0)
+    return (out / 1e9) if out > 0 else None
+
+
 async def token_balance(s, mint):
     """Raw token balance held by our wallet (0 if we hold none)."""
     r = await rpc(s, "getTokenAccountsByOwner",

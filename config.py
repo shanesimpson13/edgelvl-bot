@@ -16,6 +16,12 @@ TG_CHAT        = os.environ["TELEGRAM_CHAT_ID"]      # your user id, from @useri
 # and never touches an RPC or your wallet, so leave these empty until then.
 RPC_URL        = os.environ.get("RPC_URL", "https://api.mainnet-beta.solana.com")
 PRIVATE_KEY    = os.environ.get("PRIVATE_KEY", "")   # BURNER wallet, base58
+JUP_API_KEY    = os.environ.get("JUP_API_KEY", "")   # free from portal.jup.ag (live only)
+
+# ── where state lives ───────────────────────────────────────────────────────
+# Open positions are written here after every change so a crash or restart
+# can't lose track of a bag you're holding. Don't delete this while trading.
+STATE_FILE     = os.environ.get("STATE_FILE", "state/positions.json")
 
 # ── money ───────────────────────────────────────────────────────────────────
 DRY_RUN        = os.environ.get("DRY_RUN", "1") == "1"   # 1 = simulate, 0 = REAL MONEY

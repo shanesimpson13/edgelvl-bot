@@ -16,14 +16,18 @@ import aiohttp
 
 import config as C
 import jupiter as J
+import ultra as U
+import state as S
 from strategy import Session
 
 TG = f"https://api.telegram.org/bot{C.TG_TOKEN}"
 LOG = "trades.jsonl"
 
 live_sessions = {}     # mint -> Session (coins currently being worked)
-seen_signals = set()   # mints we've already offered you
 pending_tap = {}       # mint -> signal dict (offered, awaiting your call)
+
+# Persisted across restarts so a crash can't lose a bag you're holding.
+open_positions, seen_signals = S.load()
 
 
 # ── telegram ────────────────────────────────────────────────────────────────
@@ -97,6 +101,7 @@ async def offer_signals(s):
                     continue
                 seen_signals.add(mint)
                 pending_tap[mint] = sig
+                S.save(open_positions, seen_signals)
 
                 name = sig.get("name", mint[:8])
                 mc = sig.get("alert_mc") or 0
@@ -124,9 +129,12 @@ async def offer_signals(s):
 async def dry_or_live_buy(s, mint):
     """Returns (tokens_received, sol_spent, fill_price, error)."""
     if not C.DRY_RUN:
-        tx, got, err = await J.buy(s, mint, C.SIZE_SOL)
-        if err:
-            return 0, 0.0, 0.0, err
+        # Ultra: order -> sign -> execute, with on-chain confirmation inline.
+        # When this returns a signature, the transaction has already landed.
+        sig, got = await U.ultra_swap(s, U.SOL_MINT, mint,
+                                      int(C.SIZE_SOL * 1e9), J.kp, C.JUP_API_KEY)
+        if not sig or got <= 0:
+            return 0, 0.0, 0.0, "swap_failed"
         cost = C.SIZE_SOL + C.GAS_SOL
         return got, cost, cost / (got / 1e6), None
 
@@ -144,14 +152,11 @@ async def dry_or_live_sell(s, mint, raw_amount):
         return 0.0, "nothing_to_sell"
 
     if not C.DRY_RUN:
-        before = await J.rpc(s, "getBalance", [J.ME])
-        tx, err = await J.sell(s, mint, raw_amount)
-        if err:
-            return 0.0, err
-        after = await J.rpc(s, "getBalance", [J.ME])
-        b0 = (before.get("result") or {}).get("value", 0)
-        b1 = (after.get("result") or {}).get("value", 0)
-        return max(0.0, (b1 - b0) / 1e9), None
+        sig, out = await U.ultra_swap(s, mint, U.SOL_MINT,
+                                      int(raw_amount), J.kp, C.JUP_API_KEY)
+        if not sig:
+            return 0.0, "swap_failed"
+        return max(0.0, out / 1e9 - C.GAS_SOL), None
 
     q = await J.quote(s, mint, J.WSOL, int(raw_amount))
     out = int(q.get("outAmount", 0) or 0)
@@ -217,6 +222,10 @@ async def work_coin(s, sig):
                         break
                     tokens_held, spent, entry_px = got, cost, fill_px
                     sess.on_filled(fill_px)
+                    open_positions[mint] = {"name": name, "tokens_raw": tokens_held,
+                                            "entry_px": fill_px, "spent_sol": spent,
+                                            "opened": time.time()}
+                    S.save(open_positions, seen_signals)
                     tag = " (dry)" if C.DRY_RUN else ""
                     await tg_send(s, f"🎯 <b>{name}</b> BUY{tag} · {C.SIZE_SOL} SOL @ {fill_px:.3e}\n"
                                      f"TP {C.TPS[0]}x/{C.TPS[1]}x · stop -{int(C.KILL*100)}% off peak")
@@ -230,6 +239,9 @@ async def work_coin(s, sig):
                     else:
                         received += got
                         tokens_held -= amount
+                        if mint in open_positions:
+                            open_positions[mint]["tokens_raw"] = tokens_held
+                            S.save(open_positions, seen_signals)
                         tag = " (dry)" if C.DRY_RUN else ""
                         await tg_send(s, f"💰 <b>{name}</b> {label}{tag} · sold {int(frac*100)}% "
                                          f"for {got:.4f} SOL")
@@ -261,6 +273,8 @@ async def work_coin(s, sig):
         await tg_send(s, f"💥 <b>{name}</b> error: {e}")
     finally:
         live_sessions.pop(mint, None)
+        open_positions.pop(mint, None)
+        S.save(open_positions, seen_signals)
         record(sess, entry_px, spent, received)
         await report(s, sess, entry_px, spent, received)
 
@@ -310,6 +324,28 @@ async def main():
     async with aiohttp.ClientSession() as s:
         await tg_send(s, f"⚡ <b>Bot online</b> — {mode}\n"
                          f"{C.SIZE_SOL} SOL per trade · TP {C.TPS[0]}x/{C.TPS[1]}x")
+
+        # ── did we come back holding something? ─────────────────────────────
+        # If the bot died mid-trade, those positions are still in your wallet
+        # with no take-profit and no stop. Check the wallet, tell the user, and
+        # never pretend a bag doesn't exist just because we forgot about it.
+        if open_positions and not C.DRY_RUN:
+            notes = await S.reconcile(s, open_positions, J.token_balance)
+            for n in notes:
+                await tg_send(s, f"🔄 {n}")
+            S.save(open_positions, seen_signals)
+
+        if open_positions:
+            lines = "\n".join(
+                f"• <b>{p.get('name', m[:8])}</b> — {int(p.get('tokens_raw', 0)):,} tokens"
+                for m, p in open_positions.items())
+            await tg_send(
+                s,
+                f"⚠️ <b>You still hold {len(open_positions)} position(s)</b> from before the restart:\n"
+                f"{lines}\n\n"
+                f"The bot is <b>not</b> managing these — no take-profit, no stop. "
+                f"Sell them yourself, or greenlight the coin again to hand it back to the bot.")
+
         asyncio.create_task(offer_signals(s))
         offset = 0
         while True:
