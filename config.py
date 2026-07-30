@@ -70,3 +70,9 @@ MAX_HOLD       = 21600   # force-exit after 6h. These coins peak ~11 min in and
 SLIPPAGE_BPS   = 1500    # 1500 = 15%. Memecoins move; a tight cap just means
                          #   your exit fails and you hold the bag.
 PRIORITY_LAMPS = 2_000_000   # priority fee ceiling (~0.002 SOL)
+GAS_SOL        = 0.0005  # per transaction: network fee + typical priority tip.
+                         # Dry run subtracts this too, so its numbers match live.
+                         # NOTE: gas is a FIXED cost, so it hurts small trades most.
+                         # A full trade is 3 transactions (buy + 2 take-profits), so
+                         # at 0.05 SOL that's ~3% of your position gone to fees before
+                         # the price does anything. Raising SIZE_SOL dilutes this drag.

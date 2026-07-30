@@ -115,6 +115,51 @@ async def offer_signals(s):
         await asyncio.sleep(C.FEED_POLL_SEC)
 
 
+# ── fills ───────────────────────────────────────────────────────────────────
+# Dry run and live take the SAME path up to the point of signing. Both price the
+# trade with a real Jupiter quote at the real size, so fees, routing and price
+# impact are identical. The only thing dry run skips is broadcasting it.
+# That means dry-run P&L is directly comparable to live P&L — not a rosy version.
+
+async def dry_or_live_buy(s, mint):
+    """Returns (tokens_received, sol_spent, fill_price, error)."""
+    if not C.DRY_RUN:
+        tx, got, err = await J.buy(s, mint, C.SIZE_SOL)
+        if err:
+            return 0, 0.0, 0.0, err
+        cost = C.SIZE_SOL + C.GAS_SOL
+        return got, cost, cost / (got / 1e6), None
+
+    q = await J.quote(s, J.WSOL, mint, int(C.SIZE_SOL * 1e9))
+    got = int(q.get("outAmount", 0) or 0)
+    if got <= 0:
+        return 0, 0.0, 0.0, "no_route"
+    cost = C.SIZE_SOL + C.GAS_SOL          # gas is real money in dry run too
+    return got, cost, cost / (got / 1e6), None
+
+
+async def dry_or_live_sell(s, mint, raw_amount):
+    """Returns (sol_received_net_of_gas, error)."""
+    if raw_amount <= 0:
+        return 0.0, "nothing_to_sell"
+
+    if not C.DRY_RUN:
+        before = await J.rpc(s, "getBalance", [J.ME])
+        tx, err = await J.sell(s, mint, raw_amount)
+        if err:
+            return 0.0, err
+        after = await J.rpc(s, "getBalance", [J.ME])
+        b0 = (before.get("result") or {}).get("value", 0)
+        b1 = (after.get("result") or {}).get("value", 0)
+        return max(0.0, (b1 - b0) / 1e9), None
+
+    q = await J.quote(s, mint, J.WSOL, int(raw_amount))
+    out = int(q.get("outAmount", 0) or 0)
+    if out <= 0:
+        return 0.0, "no_route"
+    return max(0.0, out / 1e9 - C.GAS_SOL), None
+
+
 # ── working a single coin ───────────────────────────────────────────────────
 async def work_coin(s, sig):
     """From your tap until we're flat. One task per coin."""
@@ -138,6 +183,7 @@ async def work_coin(s, sig):
     entry_px = None
     spent = 0.0
     received = 0.0
+    pending = None      # action queued last poll — fills on THIS one (1s latency, like reality)
 
     try:
         while True:
@@ -147,72 +193,67 @@ async def work_coin(s, sig):
                 await tg_send(s, f"⏭️ <b>{name}</b> — no entry in {int(C.ENTRY_TIMEOUT/60)}min, standing down.")
                 break
             if sess.state == "POS" and elapsed > C.MAX_HOLD:
-                sig_, err = (None, None) if C.DRY_RUN else await J.sell(s, mint, tokens_held)
-                await tg_send(s, f"⌛ <b>{name}</b> — max hold reached, closing out.")
+                got, err = await dry_or_live_sell(s, mint, tokens_held)
+                if not err:
+                    received += got
+                    tokens_held = 0
+                await tg_send(s, f"⌛ <b>{name}</b> — max hold reached, closed out.")
                 break
 
             price = await J.get_price(s, mint)
-            action = sess.feed(price)
 
-            if action is None:
-                await asyncio.sleep(C.POLL_SEC)
-                continue
+            # ── fill whatever was decided on the PREVIOUS poll ──────────────
+            # Real trades don't fill at the price that triggered them. By the time
+            # your transaction lands the market has moved. Dry run models that the
+            # same way live does: decide now, fill on the next tick, at a real
+            # Jupiter quote for the real size (fees + price impact included).
+            if pending is not None:
+                act, pending = pending, None
 
-            # ── BUY ──
-            if action[0] == "BUY":
-                if C.DRY_RUN:
-                    entry_px = price
-                    tokens_held = int(C.SIZE_SOL / price * 1e6)
-                    spent = C.SIZE_SOL
-                    sess.on_filled(price)
-                    await tg_send(s, f"🎯 <b>{name}</b> BUY (dry) · {C.SIZE_SOL} SOL @ {price:.3e}")
-                else:
-                    tx, got, err = await J.buy(s, mint, C.SIZE_SOL)
+                if act[0] == "BUY":
+                    got, cost, fill_px, err = await dry_or_live_buy(s, mint)
                     if err:
                         await tg_send(s, f"❌ <b>{name}</b> buy failed — {err}. No money spent.")
                         break
-                    tokens_held = got
-                    entry_px = price
-                    spent = C.SIZE_SOL
-                    sess.on_filled(price)
-                    await tg_send(s, f"🎯 <b>{name}</b> BUY · {C.SIZE_SOL} SOL @ {price:.3e}\n"
+                    tokens_held, spent, entry_px = got, cost, fill_px
+                    sess.on_filled(fill_px)
+                    tag = " (dry)" if C.DRY_RUN else ""
+                    await tg_send(s, f"🎯 <b>{name}</b> BUY{tag} · {C.SIZE_SOL} SOL @ {fill_px:.3e}\n"
                                      f"TP {C.TPS[0]}x/{C.TPS[1]}x · stop -{int(C.KILL*100)}% off peak")
 
-            # ── TAKE PROFIT (a rung of the ladder) ──
-            elif action[0] == "SELL":
-                frac = action[1]
-                label = action[2]
-                amount = int(tokens_held * frac)
-                if C.DRY_RUN:
-                    received += amount / 1e6 * price
-                    tokens_held -= amount
-                    await tg_send(s, f"💰 <b>{name}</b> {label} (dry) · sold {int(frac*100)}%")
-                else:
-                    tx, err = await J.sell(s, mint, amount)
+                elif act[0] == "SELL":
+                    frac, label = act[1], act[2]
+                    amount = int(tokens_held * frac)
+                    got, err = await dry_or_live_sell(s, mint, amount)
                     if err:
                         await tg_send(s, f"⚠️ <b>{name}</b> {label} sell failed — {err}. Still holding.")
                     else:
-                        tokens_held = await J.token_balance(s, mint)
-                        await tg_send(s, f"💰 <b>{name}</b> {label} · sold {int(frac*100)}% @ {price:.3e}")
-                if tokens_held <= 0 or sess.tp_done >= len(C.TPS):
-                    sess.on_closed()
-                    break
+                        received += got
+                        tokens_held -= amount
+                        tag = " (dry)" if C.DRY_RUN else ""
+                        await tg_send(s, f"💰 <b>{name}</b> {label}{tag} · sold {int(frac*100)}% "
+                                         f"for {got:.4f} SOL")
+                    if tokens_held <= 0 or sess.tp_done >= len(C.TPS):
+                        sess.on_closed()
+                        break
 
-            # ── STOP ──
-            elif action[0] == "SELLALL":
-                if C.DRY_RUN:
-                    received += tokens_held / 1e6 * price
-                    tokens_held = 0
-                    await tg_send(s, f"🔴 <b>{name}</b> stop (dry) @ {price:.3e}")
-                else:
-                    tx, err = await J.sell(s, mint, tokens_held)
+                elif act[0] == "SELLALL":
+                    got, err = await dry_or_live_sell(s, mint, tokens_held)
                     if err:
                         await tg_send(s, f"🚨 <b>{name}</b> STOP SELL FAILED — {err}. "
                                          f"<b>Check your wallet.</b>")
                     else:
-                        await tg_send(s, f"🔴 <b>{name}</b> stopped out @ {price:.3e}")
-                sess.on_closed()
-                break
+                        received += got
+                        tokens_held = 0
+                        tag = " (dry)" if C.DRY_RUN else ""
+                        await tg_send(s, f"🔴 <b>{name}</b> stopped out{tag} for {got:.4f} SOL")
+                    sess.on_closed()
+                    break
+
+            # ── decide (fills next poll) ───────────────────────────────────
+            action = sess.feed(price)
+            if action is not None:
+                pending = action
 
             await asyncio.sleep(C.POLL_SEC)
 
