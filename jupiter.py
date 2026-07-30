@@ -15,8 +15,9 @@ import config as C
 JUP = "https://lite-api.jup.ag/swap/v1"
 WSOL = "So11111111111111111111111111111111111111112"
 
-kp = Keypair.from_base58_string(C.PRIVATE_KEY)
-ME = str(kp.pubkey())
+# Wallet is only needed for live trading. In dry run there's no key and no signing.
+kp = Keypair.from_base58_string(C.PRIVATE_KEY) if C.PRIVATE_KEY else None
+ME = str(kp.pubkey()) if kp else None
 
 
 async def rpc(s, method, params):

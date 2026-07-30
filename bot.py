@@ -112,7 +112,7 @@ async def offer_signals(s):
                     [[{"text": "🟢 GREENLIGHT", "callback_data": f"go:{mint}"}]])
         except Exception as e:
             print(f"offer error: {e}")
-        await asyncio.sleep(20)
+        await asyncio.sleep(C.FEED_POLL_SEC)
 
 
 # ── working a single coin ───────────────────────────────────────────────────

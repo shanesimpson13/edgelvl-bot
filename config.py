@@ -9,16 +9,21 @@ import os
 # ── your credentials ────────────────────────────────────────────────────────
 EDGE_API_KEY   = os.environ["EDGE_API_KEY"]          # from edgelvl.app/welcome
 EDGE_API       = "https://api.scgalpha.com"
-RPC_URL        = os.environ["RPC_URL"]               # your own RPC (Helius free tier is fine)
-PRIVATE_KEY    = os.environ["PRIVATE_KEY"]           # BURNER wallet, base58
 TG_TOKEN       = os.environ["TELEGRAM_BOT_TOKEN"]    # your bot, from @BotFather
 TG_CHAT        = os.environ["TELEGRAM_CHAT_ID"]      # your user id, from @userinfobot
+
+# Only needed when you go LIVE (Module 08). Dry run reads prices from Jupiter
+# and never touches an RPC or your wallet, so leave these empty until then.
+RPC_URL        = os.environ.get("RPC_URL", "https://api.mainnet-beta.solana.com")
+PRIVATE_KEY    = os.environ.get("PRIVATE_KEY", "")   # BURNER wallet, base58
 
 # ── money ───────────────────────────────────────────────────────────────────
 DRY_RUN        = os.environ.get("DRY_RUN", "1") == "1"   # 1 = simulate, 0 = REAL MONEY
 SIZE_SOL       = float(os.environ.get("SIZE_SOL", "0.05"))  # per trade
 
 # ── the feed ────────────────────────────────────────────────────────────────
+FEED_POLL_SEC  = 10      # how often to check for new signals (10s = you see an alert
+                         # within ~5s of it firing; polling faster gains nothing)
 POLL_SEC       = 1.0     # price poll interval. 1s is the sweet spot: fast enough to
                          # track the move, slow enough to ignore 1-second wick fakes.
 PROBE_SOL      = 0.01    # quote size used to measure price (consistent yardstick)
@@ -46,6 +51,10 @@ VOLR_MIN       = 1.0     # skip the coin entirely if volR is below this
 # Sell 70% at 1.5x, the rest at 2x. Fully out at 2x — no runner, no bag-holding.
 TPS            = (1.5, 2.0)
 FRACS          = (0.70, 0.30)
+# Want a moonbag? Add a rung and keep a slice for the tail:
+#   TPS   = (1.5, 2.0, 5.0)
+#   FRACS = (0.50, 0.30, 0.20)   <- last 20% rides to 5x (or the stop takes it)
+# Fractions are of the ORIGINAL position and should total 1.0.
 
 # Stop: -50% from the position's PEAK (trailing), not from entry.
 # Why so loose? Tighter stops shook us out of coins that went on to run. A -25%
