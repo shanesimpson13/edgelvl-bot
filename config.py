@@ -55,10 +55,16 @@ SLOPE_TOL      = 0.02    # allow 2% droop before calling the trend "rolling over
 WARMUP         = 250     # polls to observe before ANY entry (~4 min). Stops you buying
                          #   into a coin you've only seen 3 seconds of.
 
-# ── volR gate (needs the signal feed) ───────────────────────────────────────
+# ── the board ───────────────────────────────────────────────────────────────
+# /top shows Solana's 5m-trending coins ranked by real trailing 5m volume.
+# Anything under this floor is noise — a chart that's barely moving isn't a
+# setup, it's a coin waiting to bleed.
+MIN_VOL_5M     = float(os.environ.get("MIN_VOL_5M", "5000"))
+
+# ── volR gate ───────────────────────────────────────────────────────────────
 # Early buy-volume vs sell-volume. Our data: coins alerting with volR < 1.0 went
 # 0-for-13. It's the single best "don't touch this" filter we have.
-# It can't be computed from price alone, so it arrives with the signal.
+# It comes from the trending feed (buy_volume_5m / sell_volume_5m).
 USE_VOLR       = True
 VOLR_MIN       = 1.0     # skip the coin entirely if volR is below this
 

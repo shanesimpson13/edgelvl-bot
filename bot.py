@@ -121,11 +121,11 @@ HELP_TEXT = (
 )
 
 
-async def fetch_board(s, hours=6, limit=40):
-    """Recent signals with live market data attached."""
+async def fetch_board(s, limit=30):
+    """Solana's 5m-trending coins, ranked by real trailing 5m volume."""
     try:
-        async with s.get(f"{C.EDGE_API}/api/terminal",
-                         params={"hours": hours, "limit": limit},
+        async with s.get(f"{C.EDGE_API}/api/trending",
+                         params={"limit": limit, "min_vol": C.MIN_VOL_5M},
                          headers={"Authorization": f"Bearer {C.EDGE_API_KEY}"},
                          timeout=aiohttp.ClientTimeout(total=20)) as r:
             if r.status != 200:
@@ -137,15 +137,18 @@ async def fetch_board(s, hours=6, limit=40):
 
 
 def _live_coins(coins, top=5):
-    """The ones still moving, freshest first.
+    """Already ranked by 5m volume server-side — just take the head."""
+    return coins[:top]
 
-    `state` says whether the coin is still showing up in the trending feed the
-    signal engine polls. A coin that's dropped out isn't being traded any more,
-    so it doesn't belong on a board about what to do next.
-    """
-    live = [c for c in coins if c.get("state") in ("hot", "cooling")]
-    live.sort(key=lambda c: -(c.get("alert_time") or 0))
-    return live[:top]
+
+def _age(secs):
+    if secs is None:
+        return "?"
+    if secs < 3600:
+        return f"{secs/60:.0f}m"
+    if secs < 86400:
+        return f"{secs/3600:.0f}h"
+    return f"{secs/86400:.0f}d"
 
 
 async def show_board(s, chat_id=None, msg_id=None):
@@ -153,23 +156,26 @@ async def show_board(s, chat_id=None, msg_id=None):
     coins = _live_coins(await fetch_board(s))
 
     if not coins:
-        text = ("<b>Nothing live right now.</b>\n\n"
-                "No recent signal is still trending. That's a normal state — "
+        text = ("<b>Nothing trending right now.</b>\n\n"
+                "Nothing is clearing the volume floor. That's a normal state — "
                 "it means there's nothing worth forcing.")
         buttons = [[{"text": "↻ Refresh", "callback_data": "board"}]]
     else:
-        lines = ["<b>Worth a look</b>  ·  still trending\n"]
+        lines = ["<b>Trending · 5m volume</b>\n"]
         buttons = []
         for c in coins:
-            name = c.get("name") or c.get("mint", "")[:8]
-            age = (time.time() - (c.get("alert_time") or time.time())) / 60
-            mc = c.get("current_mcap") or 0
-            alert_mc = c.get("alert_mcap") or 0
-            move = f"  ·  {mc/alert_mc:.1f}x since alert" if alert_mc and mc else ""
-            dot = "🟢" if c.get("state") == "hot" else "🟡"
-            lines.append(f"{dot} <b>{name}</b> — {_money(mc)}{move}"
-                         f"\n     alerted {age:.0f}m ago")
-            buttons.append([{"text": f"{name}  ·  {_money(mc)}",
+            sym = c.get("symbol") or c.get("mint", "")[:8]
+            volr = c.get("volr")
+            # volR under 1 means more was sold than bought over the window.
+            dot = "🟢" if (volr is None or volr >= 1) else "🔴"
+            vr = f"volR {volr:.2f}" if volr is not None else "volR —"
+            pc5 = c.get("pc5")
+            mv = f"{pc5:+.0f}%" if isinstance(pc5, (int, float)) else "—"
+            lines.append(
+                f"{dot} <b>{sym}</b> — {_money(c.get('vol_5m'))} <i>5m vol</i>\n"
+                f"     MC {_money(c.get('mcap'))} · {_age(c.get('age_secs'))} old · "
+                f"5m {mv} · {vr}")
+            buttons.append([{"text": f"{sym}  ·  {_money(c.get('vol_5m'))} vol",
                              "callback_data": f"coin:{c['mint']}"}])
         text = "\n".join(lines)
         buttons.append([{"text": "↻ Refresh", "callback_data": "board"}])
@@ -180,20 +186,59 @@ async def show_board(s, chat_id=None, msg_id=None):
         await tg_send(s, text, buttons)
 
 
+def trending_card(c):
+    """A coin off the trending board. Every number here is a trailing-5m figure."""
+    sym = c.get("symbol") or c.get("mint", "")[:8]
+    name = c.get("name") or ""
+    volr = c.get("volr")
+    pc5, pc1h = c.get("pc5"), c.get("pc1h")
+
+    lines = [f"🔥 <b>{sym}</b>" + (f"  ·  {name}" if name and name != sym else ""), ""]
+    lines.append(f"<b>{_money(c.get('vol_5m'))}</b> 5m volume")
+    lines.append(f"MC {_money(c.get('mcap'))}  ·  ATH {_money(c.get('ath_mcap'))}")
+
+    mom = []
+    if isinstance(pc5, (int, float)):
+        mom.append(f"5m {pc5:+.0f}%")
+    if isinstance(pc1h, (int, float)):
+        mom.append(f"1h {pc1h:+.0f}%")
+    if mom:
+        lines.append("  ·  ".join(mom))
+
+    lines.append(f"Liq {_money(c.get('liq'))}  ·  {int(c.get('holders') or 0):,} holders"
+                 f"  ·  {_age(c.get('age_secs'))} old")
+    lines.append(f"{int(c.get('swaps_5m') or 0):,} trades  "
+                 f"({int(c.get('buys_5m') or 0):,} buy / {int(c.get('sells_5m') or 0):,} sell)")
+
+    if isinstance(volr, (int, float)):
+        # Buy volume vs sell volume over the same 5 minutes.
+        flag = "  ⚠️ more sold than bought" if volr < C.VOLR_MIN else ""
+        lines.append(f"volR <b>{volr:.2f}</b>{flag}")
+
+    lines.append("")
+    lines.append(f'<a href="https://gmgn.ai/sol/token/{c["mint"]}">Chart on GMGN</a>')
+    return "\n".join(lines)
+
+
 async def show_coin(s, mint, chat_id, msg_id):
     """One coin, in place, with the greenlight."""
     coins = await fetch_board(s)
-    sig = next((c for c in coins if c.get("mint") == mint), None)
-    if sig is None:
+    coin = next((c for c in coins if c.get("mint") == mint), None)
+    if coin is None:
+        # Fall back to the signal feed — you may be opening an older card.
         sig = await lookup_signal(s, mint)
-    if sig is None:
-        await tg_edit(s, chat_id, msg_id,
-                      "Couldn't load that coin — it may have aged out of the feed.",
-                      [[{"text": "← Back", "callback_data": "board"}]])
-        return
+        if sig is None:
+            await tg_edit(s, chat_id, msg_id,
+                          "Couldn't load that coin — it may have dropped off the board.",
+                          [[{"text": "← Back", "callback_data": "board"}]])
+            return
+        pending_tap[mint] = sig
+        card = signal_card(sig)
+    else:
+        pending_tap[mint] = coin
+        card = trending_card(coin)
 
-    pending_tap[mint] = sig
-    await tg_edit(s, chat_id, msg_id, signal_card(sig), [
+    await tg_edit(s, chat_id, msg_id, card, [
         [{"text": "🟢 GREENLIGHT", "callback_data": f"go:{mint}"}],
         [{"text": "← Back", "callback_data": "board"}],
     ])
