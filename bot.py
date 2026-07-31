@@ -531,6 +531,7 @@ async def work_coin(s, sig):
 
     mode = "DRY RUN" if C.DRY_RUN else "🔴 LIVE"
     print(f"ARMED {name} ({mint[:12]}…)", flush=True)
+    await report_status(s, mint, name, "watching", None, None)
     await tg_send(
         s,
         f"👀 <b>{name}</b> armed · {mode}\n"
@@ -564,12 +565,14 @@ async def work_coin(s, sig):
             # you asked us to drop this one (only ever possible pre-entry)
             if mint in cancel_mints:
                 cancel_mints.discard(mint)
+                await report_status(s, mint, name, "unarmed", None, None)
                 break
 
             # time limits
             elapsed = time.time() - t0
             if sess.state == "WAIT" and elapsed > entry_timeout:
                 await tg_send(s, f"⏭️ <b>{name}</b> — no entry in {int(entry_timeout/60)}min, standing down.")
+                await report_status(s, mint, name, "stood down", None, None)
                 break
             if sess.state == "POS" and elapsed > max_hold:
                 got, err = await dry_or_live_sell(s, mint, tokens_held)
