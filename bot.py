@@ -118,21 +118,70 @@ async def offer_signals(s):
                 pending_tap[mint] = sig
                 S.save(open_positions, seen_signals)
 
-                name = sig.get("name", mint[:8])
-                mc = sig.get("alert_mcap") or 0
-                volr = sig.get("volr")
-                vtxt = f"volR {volr:.2f}" if isinstance(volr, (int, float)) else "volR n/a"
-                flag = ""
-                if C.USE_VOLR and isinstance(volr, (int, float)) and volr < C.VOLR_MIN:
-                    flag = "\n⚠️ <b>below volR floor</b> — historically 0/13"
-
-                await tg_send(
-                    s,
-                    f"🔔 <b>{name}</b>\n${mc/1000:,.0f}K MC · {vtxt}{flag}\n<code>{mint}</code>",
-                    [[{"text": "🟢 GREENLIGHT", "callback_data": f"go:{mint}"}]])
+                await tg_send(s, signal_card(sig),
+                              [[{"text": "🟢 GREENLIGHT", "callback_data": f"go:{mint}"}]])
         except Exception as e:
             print(f"offer error: {e}")
         await asyncio.sleep(C.FEED_POLL_SEC)
+
+
+
+def _money(v):
+    """$1.2K / $185.9K / $2.4M — readable at a glance."""
+    v = float(v or 0)
+    if v >= 1_000_000:
+        return f"${v/1_000_000:.1f}M"
+    if v >= 1_000:
+        return f"${v/1_000:.1f}K"
+    return f"${v:,.0f}"
+
+
+def signal_card(sig):
+    """The message you actually decide from.
+
+    Everything here answers a Module 04 question: is it moving, is there room
+    left, is it liquid enough, and where's the chart.
+    """
+    name = sig.get("name") or sig.get("mint", "")[:8]
+    mint = sig.get("mint", "")
+    mc = sig.get("alert_mcap") or 0
+    ath = sig.get("max_mcap") or 0
+    now = sig.get("current_mcap") or 0
+    liq = sig.get("liquidity") or 0
+    holders = int(sig.get("holders") or 0)
+    growth = sig.get("holder_growth_pct")
+    pc5, pc1h = sig.get("pc5"), sig.get("pc1h")
+    age_min = (time.time() - (sig.get("alert_time") or time.time())) / 60
+
+    lines = [f"🔔 <b>{name}</b>  ·  alerted {age_min:.0f}m ago", ""]
+
+    mc_line = f"MC {_money(mc)}"
+    if now and abs(now - mc) / max(mc, 1) > 0.05:      # only if it actually moved
+        mc_line += f" → now {_money(now)}"
+    if ath and ath > mc * 1.05:
+        mc_line += f"  ·  ATH {_money(ath)}"
+    lines.append(mc_line)
+
+    # momentum — the "is this chart alive" read
+    mom = []
+    if isinstance(pc5, (int, float)):
+        mom.append(f"5m {pc5:+.0f}%")
+    if isinstance(pc1h, (int, float)):
+        mom.append(f"1h {pc1h:+.0f}%")
+    if mom:
+        lines.append("  ·  ".join(mom))
+
+    hold = f"{holders:,} holders"
+    if isinstance(growth, (int, float)):
+        hold += f" ({growth:+.1f}%)"
+    lines.append(f"Liq {_money(liq)}  ·  {hold}")
+
+    volr = sig.get("volr")
+    if isinstance(volr, (int, float)):
+        lines.append(f"volR {volr:.2f}" + ("  ⚠️ below floor" if volr < C.VOLR_MIN else ""))
+
+    lines += ["", f'<a href="https://gmgn.ai/sol/token/{mint}">chart ↗</a>', f"<code>{mint}</code>"]
+    return "\n".join(lines)
 
 
 # ── fills ───────────────────────────────────────────────────────────────────
