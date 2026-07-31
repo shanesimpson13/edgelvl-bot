@@ -28,6 +28,9 @@ DRY_RUN        = os.environ.get("DRY_RUN", "1") == "1"   # 1 = simulate, 0 = REA
 SIZE_SOL       = float(os.environ.get("SIZE_SOL", "0.05"))  # per trade
 
 # ── the feed ────────────────────────────────────────────────────────────────
+GREENLIGHT_POLL_SEC = 5  # how often to check the terminal for coins you greenlit
+                         # at edgelvl.app. The terminal only queues the mint — your
+                         # keys and your wallet never leave your machine.
 FEED_POLL_SEC  = 10      # how often to check for new signals (10s = you see an alert
                          # within ~5s of it firing; polling faster gains nothing)
 POLL_SEC       = 1.0     # price poll interval. 1s is the sweet spot: fast enough to

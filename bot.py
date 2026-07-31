@@ -72,24 +72,63 @@ async def tg_poll_taps(s, offset):
 
         if data_str.startswith("go:"):
             mint = data_str[3:]
-
-            if mint in live_sessions:
-                await tg_send(s, "Already working that one.")
-                continue
-
-            # The card might be from an earlier run of the bot (you restarted, or
-            # you're scrolling back). A tap should still work, so if we don't
-            # recognise the mint, go and fetch it rather than silently ignoring you.
-            sig = pending_tap.pop(mint, None)
-            if sig is None:
-                sig = await lookup_signal(s, mint)
-            if sig is None:
-                await tg_send(s, "Couldn't load that coin — it may have aged out "
-                                 "of the feed. Tap a more recent signal.")
-                continue
-
-            asyncio.create_task(work_coin(s, sig))
+            await arm_mint(s, mint)
     return offset
+
+
+async def arm_mint(s, mint):
+    """Start working a coin. Both the Telegram tap and the web terminal land here.
+
+    Returns True if a session started. The card might be from an earlier run of
+    the bot (you restarted, or you're scrolling back), so if we don't recognise
+    the mint, go and fetch it rather than silently ignoring you.
+    """
+    if mint in live_sessions:
+        await tg_send(s, "Already working that one.")
+        return False
+
+    sig = pending_tap.pop(mint, None)
+    if sig is None:
+        sig = await lookup_signal(s, mint)
+    if sig is None:
+        await tg_send(s, "Couldn't load that coin — it may have aged out "
+                         "of the feed. Tap a more recent signal.")
+        return False
+
+    asyncio.create_task(work_coin(s, sig))
+    return True
+
+
+async def poll_web_greenlights(s):
+    """Coins you greenlit in the terminal at edgelvl.app.
+
+    The terminal never touches your wallet — it just queues the mint against your
+    licence key. This is the bot picking that up and arming it, exactly as if you
+    had tapped the button in Telegram. Everything after this is identical.
+    """
+    hdrs = {"Authorization": f"Bearer {C.EDGE_API_KEY}"}
+    while True:
+        try:
+            async with s.get(f"{C.EDGE_API}/api/greenlights", headers=hdrs,
+                             timeout=aiohttp.ClientTimeout(total=15)) as r:
+                mints = (await r.json()).get("mints", []) if r.status == 200 else []
+        except Exception:
+            mints = []
+
+        for mint in mints:
+            armed = await arm_mint(s, mint)
+            if armed:
+                await tg_send(s, "🖥 Greenlit from the terminal.")
+            # Ack either way — a mint we can't arm shouldn't be handed back forever.
+            try:
+                async with s.post(f"{C.EDGE_API}/api/greenlights/ack",
+                                  json={"mint": mint}, headers=hdrs,
+                                  timeout=aiohttp.ClientTimeout(total=15)):
+                    pass
+            except Exception:
+                pass
+
+        await asyncio.sleep(C.GREENLIGHT_POLL_SEC)
 
 
 async def lookup_signal(s, mint):
@@ -444,6 +483,7 @@ async def main():
                 f"Sell them yourself, or greenlight the coin again to hand it back to the bot.")
 
         asyncio.create_task(offer_signals(s))
+        asyncio.create_task(poll_web_greenlights(s))
         offset = 0
         while True:
             offset = await tg_poll_taps(s, offset)
