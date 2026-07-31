@@ -1,7 +1,7 @@
 """
 bot.py — the whole system, running.
 
-    signals in  →  you tap GREENLIGHT  →  bot works the entry  →  bot takes profit
+    5m trending in  →  you GREENLIGHT  →  bot works the entry  →  bot takes profit
 
 Nothing trades without your tap. Run it with DRY_RUN=1 until you've seen it work.
 
@@ -22,13 +22,13 @@ from strategy import Session
 
 TG = f"https://api.telegram.org/bot{C.TG_TOKEN}"
 LOG = "trades.jsonl"
-START_TS = time.time()   # ignore alerts that fired before the bot started
+START_TS = time.time()
 
 live_sessions = {}     # mint -> Session (coins currently being worked)
 pending_tap = {}       # mint -> signal dict (offered, awaiting your call)
 
 # Persisted across restarts so a crash can't lose a bag you're holding.
-open_positions, seen_signals, armed_mints = S.load()
+open_positions, seen_signals, armed_mints = S.load()   # seen_ kept for state compat
 
 
 # ── telegram ────────────────────────────────────────────────────────────────
@@ -223,23 +223,17 @@ def trending_card(c):
 
 async def show_coin(s, mint, chat_id, msg_id):
     """One coin, in place, with the greenlight."""
-    coins = await fetch_board(s)
-    coin = next((c for c in coins if c.get("mint") == mint), None)
+    # The board is filtered by the volume floor; look wider before giving up,
+    # since you may be opening a card from a few minutes ago.
+    coin = await lookup_coin(s, mint)
     if coin is None:
-        # Fall back to the signal feed — you may be opening an older card.
-        sig = await lookup_signal(s, mint)
-        if sig is None:
-            await tg_edit(s, chat_id, msg_id,
-                          "Couldn't load that coin — it may have dropped off the board.",
-                          [[{"text": "← Back", "callback_data": "board"}]])
-            return
-        pending_tap[mint] = sig
-        card = signal_card(sig)
-    else:
-        pending_tap[mint] = coin
-        card = trending_card(coin)
+        await tg_edit(s, chat_id, msg_id,
+                      "Couldn't load that coin — it may have dropped off the board.",
+                      [[{"text": "← Back", "callback_data": "board"}]])
+        return
 
-    await tg_edit(s, chat_id, msg_id, card, [
+    pending_tap[mint] = coin
+    await tg_edit(s, chat_id, msg_id, trending_card(coin), [
         [{"text": "🟢 GREENLIGHT", "callback_data": f"go:{mint}"}],
         [{"text": "← Back", "callback_data": "board"}],
     ])
@@ -268,7 +262,7 @@ async def arm_mint(s, mint):
 
     sig = pending_tap.pop(mint, None)
     if sig is None:
-        sig = await lookup_signal(s, mint)
+        sig = await lookup_coin(s, mint)
     if sig is None:
         await tg_send(s, "Couldn't load that coin — it may have aged out "
                          "of the feed. Tap a more recent signal.")
@@ -312,14 +306,8 @@ async def poll_web_greenlights(s):
         await asyncio.sleep(C.GREENLIGHT_POLL_SEC)
 
 
-async def lookup_signal(s, mint):
-    """Find one coin by mint, from either place a greenlight can come from.
-
-    The board shows Solana's 5m-trending coins, most of which were never vault
-    signals — so searching only the signal feed silently refuses to arm them.
-    Trending first (that's what you're looking at), then the signal feed for
-    older cards.
-    """
+async def lookup_coin(s, mint):
+    """Find one coin on the trending board by mint."""
     # min_vol=0: you might greenlight something below the board's display floor,
     # and refusing to arm a coin you deliberately picked would be wrong.
     for c in await fetch_board(s, limit=50, min_vol=0):
@@ -327,61 +315,7 @@ async def lookup_signal(s, mint):
             # symbol is what the board shows; fall back to the long name
             return {**c, "mint": mint,
                     "name": c.get("symbol") or c.get("name") or mint[:8]}
-
-    for sig in await fetch_signals(s, limit=200):
-        if sig.get("mint") == mint:
-            return sig
     return None
-
-
-# ── signal feed ─────────────────────────────────────────────────────────────
-async def fetch_signals(s, limit=25):
-    """Live signals. /api/journal is the members endpoint — no delay.
-
-    (The public /api/feed is deliberately 1 hour behind; it's for the website.
-    Trading off it would mean buying coins that already finished moving.)
-    """
-    try:
-        async with s.get(f"{C.EDGE_API}/api/journal",
-                         params={"limit": limit},
-                         headers={"Authorization": f"Bearer {C.EDGE_API_KEY}"},
-                         timeout=aiohttp.ClientTimeout(total=15)) as r:
-            if r.status == 401:
-                print("API key rejected (401) — check EDGE_API_KEY / subscription active")
-                return []
-            data = await r.json()
-    except Exception as e:
-        print(f"feed error: {e}")
-        return []
-    if data.get("delayed"):
-        print("WARNING: feed reports delayed data — not tradeable")
-        return []
-    return data.get("alerts", [])
-
-
-async def offer_signals(s):
-    """Push new signals to Telegram with a GREENLIGHT button."""
-    while True:
-        try:
-            for sig in await fetch_signals(s):
-                mint = sig.get("mint")
-                if not mint or mint in seen_signals:
-                    continue
-                if (sig.get("alert_time") or 0) < START_TS:
-                    seen_signals.add(mint)      # pre-existing backlog: mark, don't offer
-                    continue
-                seen_signals.add(mint)
-                pending_tap[mint] = sig
-                S.save(open_positions, seen_signals, armed_mints)
-
-                # Quiet by default — the board is where you decide. See config.
-                if C.PUSH_EVERY_SIGNAL:
-                    await tg_send(s, signal_card(sig),
-                                  [[{"text": "🟢 GREENLIGHT", "callback_data": f"go:{mint}"}]])
-        except Exception as e:
-            print(f"offer error: {e}")
-        await asyncio.sleep(C.FEED_POLL_SEC)
-
 
 
 def _money(v):
@@ -393,60 +327,6 @@ def _money(v):
         return f"${v/1_000:.1f}K"
     return f"${v:,.0f}"
 
-
-def signal_card(sig):
-    """The message you actually decide from.
-
-    Everything here answers a Module 04 question: is it moving, is there room
-    left, is it liquid enough, and where's the chart.
-    """
-    name = sig.get("name") or sig.get("mint", "")[:8]
-    mint = sig.get("mint", "")
-    mc = sig.get("alert_mcap") or 0
-    ath = sig.get("max_mcap") or 0
-    now = sig.get("current_mcap") or 0
-    liq = sig.get("liquidity") or 0
-    holders = int(sig.get("holders") or 0)
-    growth = sig.get("holder_growth_pct")
-    pc5, pc1h = sig.get("pc5"), sig.get("pc1h")
-    age_min = (time.time() - (sig.get("alert_time") or time.time())) / 60
-
-    lines = [f"🔔 <b>{name}</b>  ·  alerted {age_min:.0f}m ago", ""]
-
-    mc_line = f"MC {_money(mc)}"
-    if now and abs(now - mc) / max(mc, 1) > 0.05:      # only if it actually moved
-        mc_line += f" → now {_money(now)}"
-    if ath and ath > mc * 1.05:
-        mc_line += f"  ·  ATH {_money(ath)}"
-    lines.append(mc_line)
-
-    # momentum — the "is this chart alive" read
-    mom = []
-    if isinstance(pc5, (int, float)):
-        mom.append(f"5m {pc5:+.0f}%")
-    if isinstance(pc1h, (int, float)):
-        mom.append(f"1h {pc1h:+.0f}%")
-    if mom:
-        lines.append("  ·  ".join(mom))
-
-    hold = f"{holders:,} holders"
-    if isinstance(growth, (int, float)):
-        hold += f" ({growth:+.1f}%)"
-    lines.append(f"Liq {_money(liq)}  ·  {hold}")
-
-    volr = sig.get("volr")
-    if isinstance(volr, (int, float)):
-        lines.append(f"volR {volr:.2f}" + ("  ⚠️ below floor" if volr < C.VOLR_MIN else ""))
-
-    lines += ["", f'<a href="https://gmgn.ai/sol/token/{mint}">chart ↗</a>', f"<code>{mint}</code>"]
-    return "\n".join(lines)
-
-
-# ── fills ───────────────────────────────────────────────────────────────────
-# Dry run and live take the SAME path up to the point of signing. Both price the
-# trade with a real Jupiter quote at the real size, so fees, routing and price
-# impact are identical. The only thing dry run skips is broadcasting it.
-# That means dry-run P&L is directly comparable to live P&L — not a rosy version.
 
 async def dry_or_live_buy(s, mint):
     """Returns (tokens_received, sol_spent, fill_price, error)."""
@@ -702,7 +582,7 @@ async def main():
         if armed_mints:
             recovered = []
             for mint in list(armed_mints):
-                sig = await lookup_signal(s, mint)
+                sig = await lookup_coin(s, mint)
                 if sig and mint not in live_sessions:
                     asyncio.create_task(work_coin(s, sig))
                     recovered.append(sig.get("name", mint[:8]))
@@ -713,7 +593,6 @@ async def main():
                 await tg_send(s, f"🔄 <b>Picked back up after the restart:</b> "
                                  f"{', '.join(recovered)}")
 
-        asyncio.create_task(offer_signals(s))
         asyncio.create_task(poll_web_greenlights(s))
         offset = 0
         while True:
