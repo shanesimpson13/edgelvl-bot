@@ -683,6 +683,10 @@ async def work_coin(s, sig):
               f"peak_after_tap={sess.peak_since_tap()}", flush=True)
         live_sessions.pop(mint, None)
         open_positions.pop(mint, None)
+        # The session is over however it ended — bought out, stopped, timed out
+        # or dropped. Leaving it armed would re-arm a finished coin on the next
+        # restart, which is how you end up watching yesterday's trade.
+        armed_mints.discard(mint)
         S.save(open_positions, seen_signals, armed_mints)
         record(sess, entry_px, spent, received)
         await report(s, sess, entry_px, spent, received)
