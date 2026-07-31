@@ -296,7 +296,7 @@ async def fetch_settings(s):
         return {}
 
 
-async def report_status(s, mint, name, state, mc, pnl_frac, mult=None, open_pct=None):
+async def report_status(s, mint, name, state, mc, pnl_frac, mult=None, open_pct=None, band=None):
     """Tell the terminal what the bot just did.
 
     One-way and best-effort: the bot owns positions and P&L, the terminal only
@@ -306,7 +306,7 @@ async def report_status(s, mint, name, state, mc, pnl_frac, mult=None, open_pct=
         await s.post(f"{C.EDGE_API}/api/status",
                      json={"mint": mint, "name": name, "state": state,
                            "mc": mc, "pnl": pnl_frac, "dry_run": C.DRY_RUN,
-                           "mult": mult, "open_pct": open_pct},
+                           "mult": mult, "open_pct": open_pct, "band": band},
                      headers={"Authorization": f"Bearer {C.EDGE_API_KEY}"},
                      timeout=aiohttp.ClientTimeout(total=10))
     except Exception:
@@ -544,6 +544,7 @@ async def work_coin(s, sig):
     t0 = time.time()
     dead_polls = 0      # consecutive polls with no price back
     tokens_original = 0
+    last_band = 0.0
 
     # Market cap, never raw price — a price like 1.885e-07 tells you nothing.
     # The board's market cap and our first quote are from the same moment, so
@@ -605,6 +606,22 @@ async def work_coin(s, sig):
 
             if mc_factor is None and price and arm_mcap:
                 mc_factor = arm_mcap / price      # first quote pairs with the board's mcap
+
+            # Publish the live entry band: the dip it needs, and the reclaim
+            # that would fire. Only while waiting, and only every 15s — this is
+            # our own API, but there's no reason to chatter.
+            if (sess.state == "WAIT" and price and mc_factor
+                    and time.time() - last_band > 15):
+                last_band = time.time()
+                await report_status(
+                    s, mint, name, "watching", MC(price), None,
+                    band={
+                        "hi": MC(sess.hi / 1) if sess.hi else None,
+                        "dip": MC(sess.hi * (1 - sess.dip)) if sess.hi else None,
+                        "reclaim": MC(sess.low * sess.bounce) if sess.low else None,
+                        "ceiling": MC(sess.peak * sess.pico) if sess.peak else None,
+                        "warmup_left": max(0, sess.warmup - sess.n),
+                    })
 
             # ── fill whatever was decided on the PREVIOUS poll ──────────────
             # Real trades don't fill at the price that triggered them. By the time
