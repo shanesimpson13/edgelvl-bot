@@ -36,10 +36,15 @@ class Session:
         self.deadcat = float(cfg.get("deadcat", C.DEADCAT))
         self.pico = float(cfg.get("pico", C.PICO))
         self.volr_min = float(cfg.get("volr_min", C.VOLR_MIN))
-        if "tp1" in cfg and "tp2" in cfg:
-            self.tps = (float(cfg["tp1"]), float(cfg["tp2"]))
-            f1 = float(cfg.get("frac1", C.FRACS[0]))
-            self.fracs = (f1, round(1.0 - f1, 6))
+        if "tp1" in cfg:
+            if float(cfg.get("use_tp2", 1)):
+                self.tps = (float(cfg["tp1"]), float(cfg.get("tp2", C.TPS[1])))
+                f1 = float(cfg.get("frac1", C.FRACS[0]))
+                self.fracs = (f1, round(1.0 - f1, 6))
+            else:
+                # One rung: sell the whole position at TP1 and re-greenlight if
+                # you want another round.
+                self.tps, self.fracs = (float(cfg["tp1"]),), (1.0,)
         else:
             self.tps, self.fracs = C.TPS, C.FRACS
 
