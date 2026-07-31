@@ -102,4 +102,33 @@ def test_swap_rate_windows():
 
 
 test_swap_rate_windows()
+
+
+def test_custom_settings():
+    """Settings from the terminal must actually drive the session."""
+    cfg = {"dip": 0.30, "bounce": 1.10, "kill": 0.25, "tp1": 3.0, "tp2": 5.0,
+           "frac1": 0.5, "volr_min": 2.0}
+    s = Session("m", "custom", volr=1.5, cfg=cfg)
+
+    assert s.dip == 0.30 and s.bounce == 1.10 and s.kill == 0.25
+    assert s.tps == (3.0, 5.0) and s.fracs == (0.5, 0.5), s.fracs
+    # volr 1.5 passes the shipped 1.0 floor but not this user's 2.0
+    assert s.blocked_reason() is not None, "custom volr floor must apply"
+
+    # and the shipped defaults still apply when nothing is set
+    d = Session("m", "default", volr=1.5)
+    assert d.dip == C.DIP and d.tps == C.TPS and d.blocked_reason() is None
+
+    # a 30% dip must not trigger on a 20% dip
+    s2 = Session("m", "deep", cfg={"dip": 0.30, "bounce": 1.10})
+    s2.warmup = 1
+    for p in [100.0] * 5 + [80.0, 88.0]:      # -20% then +10%
+        assert s2.feed(p) != ("BUY",), "20% dip must not satisfy a 30% requirement"
+    for p in [100.0, 65.0, 72.0]:             # -35% then +10.8%
+        got = s2.feed(p)
+    assert got == ("BUY",), "35% dip + 10% reclaim should trigger"
+    print("PASS 10 · terminal settings drive the session (dip/bounce/kill/TPs/volR)")
+
+
+test_custom_settings()
 print("\nALL STRATEGY TESTS PASSED")

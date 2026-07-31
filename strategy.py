@@ -22,9 +22,26 @@ import config as C
 class Session:
     """One coin, one greenlight, from tap to flat."""
 
-    def __init__(self, mint, name, volr=None, swaps_per_sec=None):
+    def __init__(self, mint, name, volr=None, swaps_per_sec=None, cfg=None):
         self.mint, self.name = mint, name
         self.volr = volr                  # buy vol / sell vol over the last 5m
+
+        # Your settings, resolved ONCE when the session starts. Deliberately not
+        # re-read while a trade is open: editing a take-profit on a position
+        # you're already holding is how people talk themselves into moving a stop.
+        cfg = cfg or {}
+        self.dip = float(cfg.get("dip", C.DIP))
+        self.bounce = float(cfg.get("bounce", C.BOUNCE))
+        self.kill = float(cfg.get("kill", C.KILL))
+        self.deadcat = float(cfg.get("deadcat", C.DEADCAT))
+        self.pico = float(cfg.get("pico", C.PICO))
+        self.volr_min = float(cfg.get("volr_min", C.VOLR_MIN))
+        if "tp1" in cfg and "tp2" in cfg:
+            self.tps = (float(cfg["tp1"]), float(cfg["tp2"]))
+            f1 = float(cfg.get("frac1", C.FRACS[0]))
+            self.fracs = (f1, round(1.0 - f1, 6))
+        else:
+            self.tps, self.fracs = C.TPS, C.FRACS
 
         # The original strategy counted SWAPS, not seconds: it needed 250 swaps of
         # evidence before entering and a 300-swap slope window. We poll once a
@@ -86,8 +103,8 @@ class Session:
 
     def blocked_reason(self):
         """Why we'd refuse to trade this coin at all. None = it's tradeable."""
-        if C.USE_VOLR and self.volr is not None and self.volr < C.VOLR_MIN:
-            return f"volR {self.volr:.2f} < {C.VOLR_MIN} — early sell pressure (0/13 historically)"
+        if C.USE_VOLR and self.volr is not None and self.volr < self.volr_min:
+            return f"volR {self.volr:.2f} < {self.volr_min} — early sell pressure (0/13 historically)"
         return None
 
     # ── the loop ────────────────────────────────────────────────────────────
@@ -124,7 +141,7 @@ class Session:
 
     def _wait(self, price, sp):
         # 1. are we in a dip? track how low it goes.
-        if price <= self.hi * (1 - C.DIP):
+        if price <= self.hi * (1 - self.dip):
             self.low = price if self.low is None else min(self.low, price)
             return None
 
@@ -133,7 +150,7 @@ class Session:
             return None
 
         # 3. has it bounced off that low?
-        if price < self.low * C.BOUNCE:
+        if price < self.low * self.bounce:
             return None
 
         # 4. bounce confirmed — now the filters
@@ -141,10 +158,10 @@ class Session:
             return None                                    # haven't watched it long enough
         if not self._trend_ok():
             return None                                    # trend rolling over, skip
-        if sp < self.peak * (1 - C.DEADCAT):
+        if sp < self.peak * (1 - self.deadcat):
             self.low = None                                # falling knife — reset, wait for a new dip
             return None
-        if price >= self.peak * C.PICO:
+        if price >= self.peak * self.pico:
             self.low = None                                # too close to the top — wait for a lower entry
             return None
 
@@ -154,14 +171,14 @@ class Session:
         self.ppeak = max(self.ppeak, sp)
 
         # trailing stop first — protecting capital beats squeezing the last rung
-        if sp < self.ppeak * (1 - C.KILL):
+        if sp < self.ppeak * (1 - self.kill):
             return ("SELLALL", "kill")
 
         # ladder: 70% at 1.5x, 30% at 2x
-        if self.tp_done < len(C.TPS) and sp >= self.entry * C.TPS[self.tp_done]:
+        if self.tp_done < len(self.tps) and sp >= self.entry * self.tps[self.tp_done]:
             i = self.tp_done
             self.tp_done += 1
-            return ("SELL", C.FRACS[i], f"TP{C.TPS[i]}x")
+            return ("SELL", self.fracs[i], f"TP{self.tps[i]}x")
         return None
 
     # ── state transitions (called by the bot once a fill is confirmed) ──────

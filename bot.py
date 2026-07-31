@@ -279,6 +279,23 @@ async def show_positions(s):
     await tg_send(s, "\n".join(lines))
 
 
+async def fetch_settings(s):
+    """Your settings from edgelvl.app. Falls back to the shipped defaults.
+
+    Read when a session STARTS, never mid-trade — see the note in strategy.py.
+    """
+    try:
+        async with s.get(f"{C.EDGE_API}/api/settings",
+                         headers={"Authorization": f"Bearer {C.EDGE_API_KEY}"},
+                         timeout=aiohttp.ClientTimeout(total=15)) as r:
+            if r.status != 200:
+                return {}
+            return (await r.json()).get("settings") or {}
+    except Exception as e:
+        print(f"settings error: {e}", flush=True)
+        return {}
+
+
 async def report_status(s, mint, name, state, mc, pnl_frac):
     """Tell the terminal what the bot just did.
 
@@ -441,23 +458,24 @@ def _money(v):
     return f"${v:,.0f}"
 
 
-async def dry_or_live_buy(s, mint):
+async def dry_or_live_buy(s, mint, size_sol=None):
     """Returns (tokens_received, sol_spent, fill_price, error)."""
+    size_sol = C.SIZE_SOL if size_sol is None else size_sol
     if not C.DRY_RUN:
         # Ultra: order -> sign -> execute, with on-chain confirmation inline.
         # When this returns a signature, the transaction has already landed.
         sig, got = await U.ultra_swap(s, U.SOL_MINT, mint,
-                                      int(C.SIZE_SOL * 1e9), J.kp, C.JUP_API_KEY)
+                                      int(size_sol * 1e9), J.kp, C.JUP_API_KEY)
         if not sig or got <= 0:
             return 0, 0.0, 0.0, "swap_failed"
-        cost = C.SIZE_SOL + C.GAS_SOL
+        cost = size_sol + C.GAS_SOL
         return got, cost, cost / (got / 1e6), None
 
-    q = await J.quote(s, J.WSOL, mint, int(C.SIZE_SOL * 1e9))
+    q = await J.quote(s, J.WSOL, mint, int(size_sol * 1e9))
     got = int(q.get("outAmount", 0) or 0)
     if got <= 0:
         return 0, 0.0, 0.0, "no_route"
-    cost = C.SIZE_SOL + C.GAS_SOL          # gas is real money in dry run too
+    cost = size_sol + C.GAS_SOL            # gas is real money in dry run too
     return got, cost, cost / (got / 1e6), None
 
 
@@ -490,9 +508,15 @@ async def work_coin(s, sig):
     # watches before it's allowed to enter. Fast coins get a short warmup.
     swaps_5m = sig.get("swaps_5m")
     sps = (swaps_5m / 300.0) if isinstance(swaps_5m, (int, float)) and swaps_5m > 0 else None
+    cfg = await fetch_settings(s)
     sess = Session(mint, name,
                    volr=volr if isinstance(volr, (int, float)) else None,
-                   swaps_per_sec=sps)
+                   swaps_per_sec=sps, cfg=cfg)
+
+    # size and the clocks are the bot's, not the strategy's
+    size_sol = float(cfg.get("size_sol", C.SIZE_SOL))
+    entry_timeout = float(cfg.get("entry_timeout", C.ENTRY_TIMEOUT))
+    max_hold = float(cfg.get("max_hold", C.MAX_HOLD))
     live_sessions[mint] = sess
 
     blocked = sess.blocked_reason()
@@ -510,10 +534,10 @@ async def work_coin(s, sig):
     await tg_send(
         s,
         f"👀 <b>{name}</b> armed · {mode}\n"
-        f"Watching every second. It buys only after a <b>-{int(C.DIP*100)}% dip</b> "
-        f"then a <b>+{int((C.BOUNCE-1)*100)}% bounce</b> — never the top.\n"
-        f"<i>~{int(C.WARMUP*C.POLL_SEC/60)} min warmup first. "
-        f"Stands down after {int(C.ENTRY_TIMEOUT/60)} min if no setup appears.</i>")
+        f"Watching every second. It buys only after a <b>-{int(sess.dip*100)}% dip</b> "
+        f"then a <b>+{int((sess.bounce-1)*100)}% bounce</b> — never the top.\n"
+        f"<i>~{int(sess.warmup*C.POLL_SEC)}s warmup first. "
+        f"Stands down after {int(entry_timeout/60)} min if no setup appears.</i>")
 
     t0 = time.time()
     dead_polls = 0      # consecutive polls with no price back
@@ -544,10 +568,10 @@ async def work_coin(s, sig):
 
             # time limits
             elapsed = time.time() - t0
-            if sess.state == "WAIT" and elapsed > C.ENTRY_TIMEOUT:
-                await tg_send(s, f"⏭️ <b>{name}</b> — no entry in {int(C.ENTRY_TIMEOUT/60)}min, standing down.")
+            if sess.state == "WAIT" and elapsed > entry_timeout:
+                await tg_send(s, f"⏭️ <b>{name}</b> — no entry in {int(entry_timeout/60)}min, standing down.")
                 break
-            if sess.state == "POS" and elapsed > C.MAX_HOLD:
+            if sess.state == "POS" and elapsed > max_hold:
                 got, err = await dry_or_live_sell(s, mint, tokens_held)
                 if not err:
                     received += got
@@ -586,7 +610,7 @@ async def work_coin(s, sig):
                 act, pending = pending, None
 
                 if act[0] == "BUY":
-                    got, cost, fill_px, err = await dry_or_live_buy(s, mint)
+                    got, cost, fill_px, err = await dry_or_live_buy(s, mint, size_sol)
                     if err:
                         await tg_send(s, f"❌ <b>{name}</b> buy failed — {err}. No money spent.")
                         break
@@ -597,10 +621,10 @@ async def work_coin(s, sig):
                                             "opened": time.time()}
                     S.save(open_positions, seen_signals, armed_mints)
                     tag = " (dry)" if C.DRY_RUN else ""
-                    await tg_send(s, f"🎯 <b>{name}</b> BUY{tag} · {C.SIZE_SOL} SOL\n"
+                    await tg_send(s, f"🎯 <b>{name}</b> BUY{tag} · {size_sol} SOL\n"
                                      f"Entry at <b>{MC(fill_px)}</b> MC\n"
-                                     f"TP {MC(fill_px*C.TPS[0])} / {MC(fill_px*C.TPS[1])} · "
-                                     f"stop -{int(C.KILL*100)}% off peak")
+                                     f"TP {MC(fill_px*sess.tps[0])} / {MC(fill_px*sess.tps[1])} · "
+                                     f"stop -{int(sess.kill*100)}% off peak")
                     await report_status(s, mint, name, "bought", MC(fill_px), None)
 
                 elif act[0] == "SELL":
@@ -620,7 +644,7 @@ async def work_coin(s, sig):
                                          f"at <b>{MC(price)}</b> MC for {got:.4f} SOL")
                         await report_status(s, mint, name, "tp", MC(price),
                                             (received - spent) / max(spent, 1e-9))
-                    if tokens_held <= 0 or sess.tp_done >= len(C.TPS):
+                    if tokens_held <= 0 or sess.tp_done >= len(sess.tps):
                         sess.on_closed()
                         break
 
