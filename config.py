@@ -28,11 +28,15 @@ JUP_HOST       = os.environ.get("JUP_HOST", "https://api.jup.ag/swap/v1")
 # allowance Jupiter answers 429, which arrives as an empty quote and reads to the
 # strategy as "no price": it then waits forever without ever erroring. Keep this
 # at or under what your key actually allows.
-# Measured against Jupiter with no key: 1 req/s is ~50% rate-limited, 1 req/2s
-# is 100% clean. So 0.5 rps is the honest ceiling without a key — and that is
-# ONE coin at 2-second resolution. A free key from portal.jup.ag raises this a
-# lot, and you want one before watching several coins at once.
-JUP_MAX_RPS    = float(os.environ.get("JUP_MAX_RPS", "8" if os.environ.get("JUP_API_KEY") else "0.5"))
+# MEASURED, not assumed:
+#   no key  — 1 req/s is ~50% rate-limited, 1 req/2s is clean  -> 0.5 rps
+#   free key — 1 req/s is clean, 2 req/s is ~50% limited       -> 1.0 rps
+#
+# This budget is shared across every coin being watched, so ONE coin gets the
+# full 1s resolution the strategy expects and each extra coin divides it: three
+# armed coins means each is priced every ~3s. Watch fewer at once, or raise this
+# if you move to a paid Jupiter plan.
+JUP_MAX_RPS    = float(os.environ.get("JUP_MAX_RPS", "1.0" if os.environ.get("JUP_API_KEY") else "0.5"))
 JUP_COOLDOWN   = 20.0    # seconds to back off after a 429 before trying again
 
 # ── where state lives ───────────────────────────────────────────────────────
