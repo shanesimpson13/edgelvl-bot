@@ -291,7 +291,14 @@ async def poll_web_greenlights(s):
             mints = []
 
         for mint in mints:
-            armed = await arm_mint(s, mint)
+            # Never let one bad coin kill this loop — an uncaught error here
+            # takes the task down and every later greenlight silently does
+            # nothing, which is the worst possible failure for this.
+            try:
+                armed = await arm_mint(s, mint)
+            except Exception as e:
+                print(f"arm error {mint[:8]}: {e}", flush=True)
+                armed = False
             if armed:
                 await tg_send(s, "🖥 Greenlit from the terminal.")
             # Ack either way — a mint we can't arm shouldn't be handed back forever.
@@ -307,15 +314,27 @@ async def poll_web_greenlights(s):
 
 
 async def lookup_coin(s, mint):
-    """Find one coin on the trending board by mint."""
-    # min_vol=0: you might greenlight something below the board's display floor,
-    # and refusing to arm a coin you deliberately picked would be wrong.
-    for c in await fetch_board(s, limit=50, min_vol=0):
-        if c.get("mint") == mint:
-            # symbol is what the board shows; fall back to the long name
-            return {**c, "mint": mint,
-                    "name": c.get("symbol") or c.get("name") or mint[:8]}
-    return None
+    """Find one coin by mint.
+
+    Resolves against the last 30 minutes of the board, not just what's on it
+    right now — a coin near the bottom can drop off between you greenlighting it
+    and this call, and refusing a coin you were just looking at would be wrong.
+    """
+    try:
+        async with s.get(f"{C.EDGE_API}/api/coin/{mint}",
+                         headers={"Authorization": f"Bearer {C.EDGE_API_KEY}"},
+                         timeout=aiohttp.ClientTimeout(total=20)) as r:
+            if r.status != 200:
+                return None
+            c = (await r.json()).get("coin") or {}
+    except Exception as e:
+        print(f"lookup error: {e}")
+        return None
+
+    if not c.get("mint"):
+        return None
+    # symbol is what the board shows; fall back to the long name
+    return {**c, "mint": mint, "name": c.get("symbol") or c.get("name") or mint[:8]}
 
 
 def _money(v):
