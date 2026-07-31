@@ -28,7 +28,7 @@ live_sessions = {}     # mint -> Session (coins currently being worked)
 pending_tap = {}       # mint -> signal dict (offered, awaiting your call)
 
 # Persisted across restarts so a crash can't lose a bag you're holding.
-open_positions, seen_signals = S.load()
+open_positions, seen_signals, armed_mints = S.load()
 
 
 # ── telegram ────────────────────────────────────────────────────────────────
@@ -121,11 +121,12 @@ HELP_TEXT = (
 )
 
 
-async def fetch_board(s, limit=30):
+async def fetch_board(s, limit=30, min_vol=None):
     """Solana's 5m-trending coins, ranked by real trailing 5m volume."""
     try:
         async with s.get(f"{C.EDGE_API}/api/trending",
-                         params={"limit": limit, "min_vol": C.MIN_VOL_5M},
+                         params={"limit": limit,
+                                 "min_vol": C.MIN_VOL_5M if min_vol is None else min_vol},
                          headers={"Authorization": f"Bearer {C.EDGE_API_KEY}"},
                          timeout=aiohttp.ClientTimeout(total=20)) as r:
             if r.status != 200:
@@ -273,6 +274,8 @@ async def arm_mint(s, mint):
                          "of the feed. Tap a more recent signal.")
         return False
 
+    armed_mints.add(mint)
+    S.save(open_positions, seen_signals, armed_mints)
     asyncio.create_task(work_coin(s, sig))
     return True
 
@@ -310,7 +313,21 @@ async def poll_web_greenlights(s):
 
 
 async def lookup_signal(s, mint):
-    """Find one alert by mint. Used when you tap a card this run didn't send."""
+    """Find one coin by mint, from either place a greenlight can come from.
+
+    The board shows Solana's 5m-trending coins, most of which were never vault
+    signals — so searching only the signal feed silently refuses to arm them.
+    Trending first (that's what you're looking at), then the signal feed for
+    older cards.
+    """
+    # min_vol=0: you might greenlight something below the board's display floor,
+    # and refusing to arm a coin you deliberately picked would be wrong.
+    for c in await fetch_board(s, limit=50, min_vol=0):
+        if c.get("mint") == mint:
+            # symbol is what the board shows; fall back to the long name
+            return {**c, "mint": mint,
+                    "name": c.get("symbol") or c.get("name") or mint[:8]}
+
     for sig in await fetch_signals(s, limit=200):
         if sig.get("mint") == mint:
             return sig
@@ -355,7 +372,7 @@ async def offer_signals(s):
                     continue
                 seen_signals.add(mint)
                 pending_tap[mint] = sig
-                S.save(open_positions, seen_signals)
+                S.save(open_positions, seen_signals, armed_mints)
 
                 # Quiet by default — the board is where you decide. See config.
                 if C.PUSH_EVERY_SIGNAL:
@@ -537,7 +554,7 @@ async def work_coin(s, sig):
                     open_positions[mint] = {"name": name, "tokens_raw": tokens_held,
                                             "entry_px": fill_px, "spent_sol": spent,
                                             "opened": time.time()}
-                    S.save(open_positions, seen_signals)
+                    S.save(open_positions, seen_signals, armed_mints)
                     tag = " (dry)" if C.DRY_RUN else ""
                     await tg_send(s, f"🎯 <b>{name}</b> BUY{tag} · {C.SIZE_SOL} SOL @ {fill_px:.3e}\n"
                                      f"TP {C.TPS[0]}x/{C.TPS[1]}x · stop -{int(C.KILL*100)}% off peak")
@@ -553,7 +570,7 @@ async def work_coin(s, sig):
                         tokens_held -= amount
                         if mint in open_positions:
                             open_positions[mint]["tokens_raw"] = tokens_held
-                            S.save(open_positions, seen_signals)
+                            S.save(open_positions, seen_signals, armed_mints)
                         tag = " (dry)" if C.DRY_RUN else ""
                         await tg_send(s, f"💰 <b>{name}</b> {label}{tag} · sold {int(frac*100)}% "
                                          f"for {got:.4f} SOL")
@@ -590,7 +607,7 @@ async def work_coin(s, sig):
               f"peak_after_tap={sess.peak_since_tap()}", flush=True)
         live_sessions.pop(mint, None)
         open_positions.pop(mint, None)
-        S.save(open_positions, seen_signals)
+        S.save(open_positions, seen_signals, armed_mints)
         record(sess, entry_px, spent, received)
         await report(s, sess, entry_px, spent, received)
 
@@ -662,7 +679,7 @@ async def main():
             notes = await S.reconcile(s, open_positions, J.token_balance)
             for n in notes:
                 await tg_send(s, f"🔄 {n}")
-            S.save(open_positions, seen_signals)
+            S.save(open_positions, seen_signals, armed_mints)
 
         if open_positions:
             lines = "\n".join(
@@ -674,6 +691,23 @@ async def main():
                 f"{lines}\n\n"
                 f"The bot is <b>not</b> managing these — no take-profit, no stop. "
                 f"Sell them yourself, or greenlight the coin again to hand it back to the bot.")
+
+        # ── coins that were armed when we stopped ───────────────────────────
+        # Their sessions were in memory and died with the process. Pick them
+        # back up rather than leaving you thinking a coin is being watched.
+        if armed_mints:
+            recovered = []
+            for mint in list(armed_mints):
+                sig = await lookup_signal(s, mint)
+                if sig and mint not in live_sessions:
+                    asyncio.create_task(work_coin(s, sig))
+                    recovered.append(sig.get("name", mint[:8]))
+                else:
+                    armed_mints.discard(mint)      # gone from both feeds
+            S.save(open_positions, seen_signals, armed_mints)
+            if recovered:
+                await tg_send(s, f"🔄 <b>Picked back up after the restart:</b> "
+                                 f"{', '.join(recovered)}")
 
         asyncio.create_task(offer_signals(s))
         asyncio.create_task(poll_web_greenlights(s))

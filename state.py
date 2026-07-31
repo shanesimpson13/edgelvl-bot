@@ -20,32 +20,39 @@ log = logging.getLogger("state")
 STATE_FILE = Path(C.STATE_FILE)
 
 
-def save(positions, seen):
+def save(positions, seen, armed=()):
     """Write everything to disk. Called after every state change."""
     try:
         STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         tmp = STATE_FILE.with_suffix(".tmp")
         with open(tmp, "w") as f:
-            json.dump({"positions": positions, "seen": sorted(seen)}, f, default=str)
+            json.dump({"positions": positions, "seen": sorted(seen),
+                       "armed": sorted(armed)}, f, default=str)
         tmp.replace(STATE_FILE)          # atomic — a crash mid-write can't corrupt it
     except Exception as e:
         log.error(f"save failed: {e}")
 
 
 def load():
-    """Returns (positions, seen). Empty on first run."""
+    """Returns (positions, seen, armed). Empty on first run.
+
+    `armed` is coins you greenlit that hadn't bought yet. Those sessions live in
+    memory, so without this a restart drops them silently — you'd think the bot
+    was watching a coin that nothing is watching.
+    """
     if not STATE_FILE.exists():
-        return {}, set()
+        return {}, set(), set()
     try:
         d = json.load(open(STATE_FILE))
         pos = d.get("positions", {}) or {}
         seen = set(d.get("seen", []) or [])
+        armed = set(d.get("armed", []) or [])
         if pos:
             log.info(f"restored {len(pos)} open position(s) from disk")
-        return pos, seen
+        return pos, seen, armed
     except Exception as e:
         log.error(f"load failed: {e}")
-        return {}, set()
+        return {}, set(), set()
 
 
 async def reconcile(session, positions, get_balance):
