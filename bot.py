@@ -72,14 +72,36 @@ async def tg_poll_taps(s, offset):
 
         if data_str.startswith("go:"):
             mint = data_str[3:]
+
+            if mint in live_sessions:
+                await tg_send(s, "Already working that one.")
+                continue
+
+            # The card might be from an earlier run of the bot (you restarted, or
+            # you're scrolling back). A tap should still work, so if we don't
+            # recognise the mint, go and fetch it rather than silently ignoring you.
             sig = pending_tap.pop(mint, None)
-            if sig and mint not in live_sessions:
-                asyncio.create_task(work_coin(s, sig))
+            if sig is None:
+                sig = await lookup_signal(s, mint)
+            if sig is None:
+                await tg_send(s, "Couldn't load that coin — it may have aged out "
+                                 "of the feed. Tap a more recent signal.")
+                continue
+
+            asyncio.create_task(work_coin(s, sig))
     return offset
 
 
+async def lookup_signal(s, mint):
+    """Find one alert by mint. Used when you tap a card this run didn't send."""
+    for sig in await fetch_signals(s, limit=200):
+        if sig.get("mint") == mint:
+            return sig
+    return None
+
+
 # ── signal feed ─────────────────────────────────────────────────────────────
-async def fetch_signals(s):
+async def fetch_signals(s, limit=25):
     """Live signals. /api/journal is the members endpoint — no delay.
 
     (The public /api/feed is deliberately 1 hour behind; it's for the website.
@@ -87,7 +109,7 @@ async def fetch_signals(s):
     """
     try:
         async with s.get(f"{C.EDGE_API}/api/journal",
-                         params={"limit": 25},
+                         params={"limit": limit},
                          headers={"Authorization": f"Bearer {C.EDGE_API_KEY}"},
                          timeout=aiohttp.ClientTimeout(total=15)) as r:
             if r.status == 401:
@@ -245,7 +267,13 @@ async def work_coin(s, sig):
         return
 
     mode = "DRY RUN" if C.DRY_RUN else "🔴 LIVE"
-    await tg_send(s, f"👀 <b>{name}</b> armed ({mode}) — watching for the reclaim entry.")
+    await tg_send(
+        s,
+        f"👀 <b>{name}</b> armed · {mode}\n"
+        f"Watching every second. It buys only after a <b>-{int(C.DIP*100)}% dip</b> "
+        f"then a <b>+{int((C.BOUNCE-1)*100)}% bounce</b> — never the top.\n"
+        f"<i>~{int(C.WARMUP*C.POLL_SEC/60)} min warmup first. "
+        f"Stands down after {int(C.ENTRY_TIMEOUT/60)} min if no setup appears.</i>")
 
     t0 = time.time()
     tokens_held = 0
