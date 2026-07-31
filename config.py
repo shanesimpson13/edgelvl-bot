@@ -15,7 +15,7 @@ TG_CHAT        = os.environ["TELEGRAM_CHAT_ID"]      # your user id, from @useri
 # Only needed when you go LIVE (Module 08). Dry run reads prices from Jupiter
 # and never touches an RPC or your wallet, so leave these empty until then.
 RPC_URL        = os.environ.get("RPC_URL", "https://api.mainnet-beta.solana.com")
-PRIVATE_KEY    = os.environ.get("PRIVATE_KEY", "")   # BURNER wallet, base58
+PRIVATE_KEY    = os.environ.get("PRIVATE_KEY", "")   # dedicated trading wallet, base58
 JUP_API_KEY    = os.environ.get("JUP_API_KEY", "")   # free from portal.jup.ag (live only)
 
 # ── where state lives ───────────────────────────────────────────────────────

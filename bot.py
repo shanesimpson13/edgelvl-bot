@@ -22,6 +22,7 @@ from strategy import Session
 
 TG = f"https://api.telegram.org/bot{C.TG_TOKEN}"
 LOG = "trades.jsonl"
+START_TS = time.time()   # ignore alerts that fired before the bot started
 
 live_sessions = {}     # mint -> Session (coins currently being worked)
 pending_tap = {}       # mint -> signal dict (offered, awaiting your call)
@@ -79,14 +80,25 @@ async def tg_poll_taps(s, offset):
 
 # ── signal feed ─────────────────────────────────────────────────────────────
 async def fetch_signals(s):
-    """New signals from your API key."""
+    """Live signals. /api/journal is the members endpoint — no delay.
+
+    (The public /api/feed is deliberately 1 hour behind; it's for the website.
+    Trading off it would mean buying coins that already finished moving.)
+    """
     try:
-        async with s.get(f"{C.EDGE_API}/api/feed?limit=25",
+        async with s.get(f"{C.EDGE_API}/api/journal",
+                         params={"limit": 25},
                          headers={"Authorization": f"Bearer {C.EDGE_API_KEY}"},
                          timeout=aiohttp.ClientTimeout(total=15)) as r:
+            if r.status == 401:
+                print("API key rejected (401) — check EDGE_API_KEY / subscription active")
+                return []
             data = await r.json()
     except Exception as e:
         print(f"feed error: {e}")
+        return []
+    if data.get("delayed"):
+        print("WARNING: feed reports delayed data — not tradeable")
         return []
     return data.get("alerts", [])
 
@@ -99,12 +111,15 @@ async def offer_signals(s):
                 mint = sig.get("mint")
                 if not mint or mint in seen_signals:
                     continue
+                if (sig.get("alert_time") or 0) < START_TS:
+                    seen_signals.add(mint)      # pre-existing backlog: mark, don't offer
+                    continue
                 seen_signals.add(mint)
                 pending_tap[mint] = sig
                 S.save(open_positions, seen_signals)
 
                 name = sig.get("name", mint[:8])
-                mc = sig.get("alert_mc") or 0
+                mc = sig.get("alert_mcap") or 0
                 volr = sig.get("volr")
                 vtxt = f"volR {volr:.2f}" if isinstance(volr, (int, float)) else "volR n/a"
                 flag = ""
