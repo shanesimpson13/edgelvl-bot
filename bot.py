@@ -26,6 +26,7 @@ START_TS = time.time()
 
 live_sessions = {}     # mint -> Session (coins currently being worked)
 pending_tap = {}       # mint -> signal dict (offered, awaiting your call)
+cancel_mints = set()   # coins you've asked the bot to stop watching
 
 # Persisted across restarts so a crash can't lose a bag you're holding.
 open_positions, seen_signals, armed_mints = S.load()   # seen_ kept for state compat
@@ -85,6 +86,8 @@ async def tg_poll_taps(s, offset):
                 await tg_send(s, HELP_TEXT)
             elif text == "/positions":
                 await show_positions(s)
+            elif text in ("/unarm", "/watching"):
+                await show_watching(s)
             continue
 
         cb = upd.get("callback_query")
@@ -107,6 +110,9 @@ async def tg_poll_taps(s, offset):
             await arm_mint(s, data_str[3:])
         elif data_str.startswith("coin:"):
             await show_coin(s, data_str[5:], chat_id, msg_id)
+        elif data_str.startswith("unarm:"):
+            await unarm(s, data_str[6:])
+            await show_watching(s, chat_id, msg_id)
         elif data_str == "board":
             await show_board(s, chat_id, msg_id)
     return offset
@@ -116,6 +122,7 @@ HELP_TEXT = (
     "<b>Commands</b>\n\n"
     "/top — the coins worth a look right now\n"
     "/positions — what the bot is holding\n"
+    "/unarm — stop watching a coin\n"
     "/help — this\n\n"
     "Tap a coin on the board to see it, then <b>GREENLIGHT</b> to hand it to the bot."
 )
@@ -239,6 +246,29 @@ async def show_coin(s, mint, chat_id, msg_id):
     ])
 
 
+async def show_watching(s, chat_id=None, msg_id=None):
+    """Coins being watched, each with a button to drop it."""
+    watching = [(m, sess) for m, sess in live_sessions.items() if sess.state != "POS"]
+    if not watching:
+        text = "Not watching anything right now."
+        buttons = [[{"text": "📋 Board", "callback_data": "board"}]]
+    else:
+        lines = ["<b>Watching</b>  ·  tap to stop\n"]
+        buttons = []
+        for m, sess in watching:
+            pk = sess.peak_since_tap()
+            lines.append(f"👀 <b>{sess.name}</b>"
+                         + (f" — {pk:.2f}x since you armed it" if pk else ""))
+            buttons.append([{"text": f"🛑 Unarm {sess.name}", "callback_data": f"unarm:{m}"}])
+        text = "\n".join(lines)
+        buttons.append([{"text": "📋 Board", "callback_data": "board"}])
+
+    if msg_id:
+        await tg_edit(s, chat_id, msg_id, text, buttons)
+    else:
+        await tg_send(s, text, buttons)
+
+
 async def show_positions(s):
     if not open_positions:
         await tg_send(s, "Not holding anything.")
@@ -247,6 +277,70 @@ async def show_positions(s):
     for m, p in open_positions.items():
         lines.append(f"• <b>{p.get('name', m[:8])}</b> — {int(p.get('tokens_raw', 0)):,} tokens")
     await tg_send(s, "\n".join(lines))
+
+
+async def report_status(s, mint, name, state, mc, pnl_frac):
+    """Tell the terminal what the bot just did.
+
+    One-way and best-effort: the bot owns positions and P&L, the terminal only
+    mirrors them. A failure here must never affect a trade, so it's swallowed.
+    """
+    try:
+        await s.post(f"{C.EDGE_API}/api/status",
+                     json={"mint": mint, "name": name, "state": state,
+                           "mc": mc, "pnl": pnl_frac, "dry_run": C.DRY_RUN},
+                     headers={"Authorization": f"Bearer {C.EDGE_API_KEY}"},
+                     timeout=aiohttp.ClientTimeout(total=10))
+    except Exception:
+        pass
+
+
+async def poll_web_unarms(s):
+    """Coins you dropped in the terminal. Same effect as /unarm in Telegram."""
+    hdrs = {"Authorization": f"Bearer {C.EDGE_API_KEY}"}
+    while True:
+        try:
+            async with s.get(f"{C.EDGE_API}/api/unarms", headers=hdrs,
+                             timeout=aiohttp.ClientTimeout(total=15)) as r:
+                mints = (await r.json()).get("mints", []) if r.status == 200 else []
+        except Exception:
+            mints = []
+        for mint in mints:
+            try:
+                await unarm(s, mint, source="the terminal")
+            except Exception as e:
+                print(f"unarm error {mint[:8]}: {e}", flush=True)
+            try:
+                async with s.post(f"{C.EDGE_API}/api/unarms/ack",
+                                  json={"mint": mint}, headers=hdrs,
+                                  timeout=aiohttp.ClientTimeout(total=15)):
+                    pass
+            except Exception:
+                pass
+        await asyncio.sleep(C.GREENLIGHT_POLL_SEC)
+
+
+async def unarm(s, mint, source="you"):
+    """Stop watching a coin.
+
+    Only ever cancels a coin we have NOT bought. If there's a position open,
+    refuse — dropping the session would leave a bag in the wallet with no
+    take-profit and no stop, which is the worst state this bot can be in.
+    """
+    sess = live_sessions.get(mint)
+    if sess is None:
+        armed_mints.discard(mint)
+        S.save(open_positions, seen_signals, armed_mints)
+        return False
+
+    if sess.state == "POS" or mint in open_positions:
+        await tg_send(s, f"⚠️ <b>{sess.name}</b> is already bought — not dropping it.\n"
+                         f"The bot keeps managing the exit. Sell it yourself if you want out now.")
+        return False
+
+    cancel_mints.add(mint)
+    await tg_send(s, f"🛑 <b>{sess.name}</b> unarmed by {source} — no longer watching.")
+    return True
 
 
 async def arm_mint(s, mint):
@@ -423,6 +517,18 @@ async def work_coin(s, sig):
 
     t0 = time.time()
     dead_polls = 0      # consecutive polls with no price back
+
+    # Market cap, never raw price — a price like 1.885e-07 tells you nothing.
+    # The board's market cap and our first quote are from the same moment, so
+    # their ratio converts any later price to a market cap. Self-calibrating:
+    # no hardcoded token supply, no hardcoded SOL price to go stale.
+    mc_factor = None
+    arm_mcap = sig.get("mcap") or 0
+
+    def MC(px):
+        if not px:
+            return "—"
+        return _money(px * mc_factor) if mc_factor else f"{px:.3e}"
     tokens_held = 0
     entry_px = None
     spent = 0.0
@@ -431,6 +537,11 @@ async def work_coin(s, sig):
 
     try:
         while True:
+            # you asked us to drop this one (only ever possible pre-entry)
+            if mint in cancel_mints:
+                cancel_mints.discard(mint)
+                break
+
             # time limits
             elapsed = time.time() - t0
             if sess.state == "WAIT" and elapsed > C.ENTRY_TIMEOUT:
@@ -463,6 +574,9 @@ async def work_coin(s, sig):
                     await tg_send(s, f"✅ <b>{name}</b> — price feed recovered.")
                 dead_polls = 0
 
+            if mc_factor is None and price and arm_mcap:
+                mc_factor = arm_mcap / price      # first quote pairs with the board's mcap
+
             # ── fill whatever was decided on the PREVIOUS poll ──────────────
             # Real trades don't fill at the price that triggered them. By the time
             # your transaction lands the market has moved. Dry run models that the
@@ -483,8 +597,11 @@ async def work_coin(s, sig):
                                             "opened": time.time()}
                     S.save(open_positions, seen_signals, armed_mints)
                     tag = " (dry)" if C.DRY_RUN else ""
-                    await tg_send(s, f"🎯 <b>{name}</b> BUY{tag} · {C.SIZE_SOL} SOL @ {fill_px:.3e}\n"
-                                     f"TP {C.TPS[0]}x/{C.TPS[1]}x · stop -{int(C.KILL*100)}% off peak")
+                    await tg_send(s, f"🎯 <b>{name}</b> BUY{tag} · {C.SIZE_SOL} SOL\n"
+                                     f"Entry at <b>{MC(fill_px)}</b> MC\n"
+                                     f"TP {MC(fill_px*C.TPS[0])} / {MC(fill_px*C.TPS[1])} · "
+                                     f"stop -{int(C.KILL*100)}% off peak")
+                    await report_status(s, mint, name, "bought", MC(fill_px), None)
 
                 elif act[0] == "SELL":
                     frac, label = act[1], act[2]
@@ -500,7 +617,9 @@ async def work_coin(s, sig):
                             S.save(open_positions, seen_signals, armed_mints)
                         tag = " (dry)" if C.DRY_RUN else ""
                         await tg_send(s, f"💰 <b>{name}</b> {label}{tag} · sold {int(frac*100)}% "
-                                         f"for {got:.4f} SOL")
+                                         f"at <b>{MC(price)}</b> MC for {got:.4f} SOL")
+                        await report_status(s, mint, name, "tp", MC(price),
+                                            (received - spent) / max(spent, 1e-9))
                     if tokens_held <= 0 or sess.tp_done >= len(C.TPS):
                         sess.on_closed()
                         break
@@ -514,7 +633,10 @@ async def work_coin(s, sig):
                         received += got
                         tokens_held = 0
                         tag = " (dry)" if C.DRY_RUN else ""
-                        await tg_send(s, f"🔴 <b>{name}</b> stopped out{tag} for {got:.4f} SOL")
+                        await tg_send(s, f"🔴 <b>{name}</b> stopped out{tag} at <b>{MC(price)}</b> MC "
+                                         f"for {got:.4f} SOL")
+                        await report_status(s, mint, name, "stopped", MC(price),
+                                            (received - spent) / max(spent, 1e-9))
                     sess.on_closed()
                     break
 
@@ -588,6 +710,7 @@ async def main():
             await s.post(f"{TG}/setMyCommands", json={"commands": [
                 {"command": "top", "description": "Coins worth a look right now"},
                 {"command": "positions", "description": "What the bot is holding"},
+                {"command": "unarm", "description": "Stop watching a coin"},
                 {"command": "help", "description": "How this works"},
             ]})
         except Exception:
@@ -637,6 +760,7 @@ async def main():
                                  f"{', '.join(recovered)}")
 
         asyncio.create_task(poll_web_greenlights(s))
+        asyncio.create_task(poll_web_unarms(s))
         offset = 0
         while True:
             offset = await tg_poll_taps(s, offset)
