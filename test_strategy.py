@@ -131,4 +131,36 @@ def test_custom_settings():
 
 
 test_custom_settings()
+
+
+def test_ladder_sells_whole_position():
+    """Take-profit fractions are of the ORIGINAL position, not what's left.
+
+    Taking frac of the remainder sells 30% of 30% on the second rung and strands
+    21% with no take-profit and no stop — in live trading, a silent orphaned bag.
+    """
+    s = Session("m", "x", cfg={"tp1": 1.5, "tp2": 2.0, "use_tp2": 1, "frac1": 0.7})
+    s.warmup = 1
+    for p in [100.0] * 5 + [80.0, 88.0]:
+        if s.feed(p) == ("BUY",):
+            s.on_filled(88.0)
+
+    original = held = 1_000_000
+    sold = []
+    for px in [140.0] * 5 + [190.0] * 5:          # median-5 needs prices to persist
+        act = s.feed(px)
+        if act and act[0] == "SELL":
+            rung = s.tp_done
+            is_last = rung >= len(s.tps)
+            amount = held if is_last else min(int(original * act[1]), held)
+            held -= amount
+            sold.append(amount / original)
+
+    assert len(sold) == 2, f"both rungs should fire, got {sold}"
+    assert abs(sold[0] - 0.70) < 0.01, f"TP1 should sell 70% of the original, sold {sold[0]:.0%}"
+    assert held == 0, f"{held} tokens stranded after the last rung"
+    print("PASS 11 · ladder sells 70%/30% of the ORIGINAL position, nothing stranded")
+
+
+test_ladder_sells_whole_position()
 print("\nALL STRATEGY TESTS PASSED")

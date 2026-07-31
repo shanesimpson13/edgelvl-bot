@@ -296,7 +296,7 @@ async def fetch_settings(s):
         return {}
 
 
-async def report_status(s, mint, name, state, mc, pnl_frac):
+async def report_status(s, mint, name, state, mc, pnl_frac, mult=None, open_pct=None):
     """Tell the terminal what the bot just did.
 
     One-way and best-effort: the bot owns positions and P&L, the terminal only
@@ -305,7 +305,8 @@ async def report_status(s, mint, name, state, mc, pnl_frac):
     try:
         await s.post(f"{C.EDGE_API}/api/status",
                      json={"mint": mint, "name": name, "state": state,
-                           "mc": mc, "pnl": pnl_frac, "dry_run": C.DRY_RUN},
+                           "mc": mc, "pnl": pnl_frac, "dry_run": C.DRY_RUN,
+                           "mult": mult, "open_pct": open_pct},
                      headers={"Authorization": f"Bearer {C.EDGE_API_KEY}"},
                      timeout=aiohttp.ClientTimeout(total=10))
     except Exception:
@@ -542,6 +543,7 @@ async def work_coin(s, sig):
 
     t0 = time.time()
     dead_polls = 0      # consecutive polls with no price back
+    tokens_original = 0
 
     # Market cap, never raw price — a price like 1.885e-07 tells you nothing.
     # The board's market cap and our first quote are from the same moment, so
@@ -618,6 +620,7 @@ async def work_coin(s, sig):
                         await tg_send(s, f"❌ <b>{name}</b> buy failed — {err}. No money spent.")
                         break
                     tokens_held, spent, entry_px = got, cost, fill_px
+                    tokens_original = got        # the ladder is fractions of THIS
                     sess.on_filled(fill_px)
                     open_positions[mint] = {"name": name, "tokens_raw": tokens_held,
                                             "entry_px": fill_px, "spent_sol": spent,
@@ -632,7 +635,13 @@ async def work_coin(s, sig):
 
                 elif act[0] == "SELL":
                     frac, label = act[1], act[2]
-                    amount = int(tokens_held * frac)
+                    rung = sess.tp_done                  # already incremented
+                    is_last = rung >= len(sess.tps)
+                    # Fractions are of the ORIGINAL position, not what's left —
+                    # taking frac of the remainder would sell 30% of 30% on the
+                    # second rung and quietly strand the rest. The last rung
+                    # sells everything still held, which also clears dust.
+                    amount = tokens_held if is_last else min(int(tokens_original * frac), tokens_held)
                     got, err = await dry_or_live_sell(s, mint, amount)
                     if err:
                         await tg_send(s, f"⚠️ <b>{name}</b> {label} sell failed — {err}. Still holding.")
@@ -643,11 +652,17 @@ async def work_coin(s, sig):
                             open_positions[mint]["tokens_raw"] = tokens_held
                             S.save(open_positions, seen_signals, armed_mints)
                         tag = " (dry)" if C.DRY_RUN else ""
-                        await tg_send(s, f"💰 <b>{name}</b> {label}{tag} · sold {int(frac*100)}% "
-                                         f"at <b>{MC(price)}</b> MC for {got:.4f} SOL")
-                        await report_status(s, mint, name, "tp", MC(price),
-                                            (received - spent) / max(spent, 1e-9))
-                    if tokens_held <= 0 or sess.tp_done >= len(sess.tps):
+                        sold_pct = round(amount / max(tokens_original, 1) * 100)
+                        open_pct = round(tokens_held / max(tokens_original, 1) * 100)
+                        mult = sess.tps[rung - 1] if rung else None
+                        await tg_send(
+                            s, f"💰 <b>{name}</b> TP{rung}{tag} · sold {sold_pct}% at "
+                               f"<b>{MC(price)}</b> MC ({mult}x) for {got:.4f} SOL"
+                               + (f"\n{open_pct}% still riding to {sess.tps[rung]}x." if not is_last else ""))
+                        await report_status(s, mint, name, f"tp{rung}", MC(price),
+                                            (received - spent) / max(spent, 1e-9),
+                                            mult=mult, open_pct=open_pct)
+                    if tokens_held <= 0 or is_last:
                         sess.on_closed()
                         break
 
