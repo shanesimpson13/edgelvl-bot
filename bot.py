@@ -267,6 +267,7 @@ async def work_coin(s, sig):
         return
 
     mode = "DRY RUN" if C.DRY_RUN else "🔴 LIVE"
+    print(f"ARMED {name} ({mint[:12]}…)", flush=True)
     await tg_send(
         s,
         f"👀 <b>{name}</b> armed · {mode}\n"
@@ -362,8 +363,12 @@ async def work_coin(s, sig):
             await asyncio.sleep(C.POLL_SEC)
 
     except Exception as e:
+        import traceback
+        print(f"work_coin {name} ERROR: {e}\n{traceback.format_exc()}", flush=True)
         await tg_send(s, f"💥 <b>{name}</b> error: {e}")
     finally:
+        print(f"DONE {name}: entered={entry_px is not None} "
+              f"peak_after_tap={sess.peak_since_tap()}", flush=True)
         live_sessions.pop(mint, None)
         open_positions.pop(mint, None)
         S.save(open_positions, seen_signals)
