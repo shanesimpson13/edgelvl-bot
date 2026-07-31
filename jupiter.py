@@ -5,19 +5,68 @@ Solana venue and always takes the best price. Free, no API key.
 Price comes from the same quote endpoint we trade through, so the number the
 strategy sees is the number you'd actually get filled at — impact included.
 """
+import asyncio
 import base64
+import time
+
 import aiohttp
 from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction
 
 import config as C
 
-JUP = "https://lite-api.jup.ag/swap/v1"
+JUP = C.JUP_HOST
 WSOL = "So11111111111111111111111111111111111111112"
 
 # Wallet is only needed for live trading. In dry run there's no key and no signing.
 kp = Keypair.from_base58_string(C.PRIVATE_KEY) if C.PRIVATE_KEY else None
 ME = str(kp.pubkey()) if kp else None
+
+# ── request pacing ──────────────────────────────────────────────────────────
+# Every watched coin polls once a second, so N coins means N requests a second.
+# Jupiter's free tier is roughly 1/sec in TOTAL, so two coins is already over it
+# — and a 429 comes back as an empty quote, which the strategy reads as "no
+# price" and silently does nothing forever. Pace every request through one gate.
+_gate = asyncio.Lock()
+_last_req = 0.0
+_rate_limited_until = 0.0
+_warned = False
+
+
+async def _paced_get(s, url, headers=None):
+    """One shared throttle for every Jupiter call, plus loud rate-limit handling."""
+    global _last_req, _rate_limited_until, _warned
+
+    async with _gate:
+        gap = 1.0 / max(C.JUP_MAX_RPS, 0.1)
+        wait = _last_req + gap - time.monotonic()
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _last_req = time.monotonic()
+
+    if time.monotonic() < _rate_limited_until:
+        return {}, "cooling"
+
+    try:
+        async with s.get(url, headers=headers or {},
+                         timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status == 429:
+                _rate_limited_until = time.monotonic() + C.JUP_COOLDOWN
+                if not _warned:
+                    _warned = True
+                    print("JUPITER RATE LIMITED (429) — prices are not updating. "
+                          "Set JUP_API_KEY (free at portal.jup.ag) or watch fewer "
+                          "coins at once.", flush=True)
+                return {}, "429"
+            if r.status != 200:
+                return {}, f"http-{r.status}"
+            return await r.json(), None
+    except Exception as e:
+        return {}, type(e).__name__
+
+
+def _headers():
+    return {"x-api-key": C.JUP_API_KEY} if C.JUP_API_KEY else {}
 
 
 async def rpc(s, method, params):
@@ -31,11 +80,8 @@ async def quote(s, in_mint, out_mint, amount, slippage_bps=None):
     url = (f"{JUP}/quote?inputMint={in_mint}&outputMint={out_mint}"
            f"&amount={int(amount)}&slippageBps={slippage_bps or C.SLIPPAGE_BPS}"
            f"&restrictIntermediateTokens=true")
-    try:
-        async with s.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
-            return await r.json()
-    except Exception:
-        return {}
+    q, err = await _paced_get(s, url, _headers())
+    return q
 
 
 async def get_price(s, mint):

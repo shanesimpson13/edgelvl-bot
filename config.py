@@ -16,7 +16,24 @@ TG_CHAT        = os.environ["TELEGRAM_CHAT_ID"]      # your user id, from @useri
 # and never touches an RPC or your wallet, so leave these empty until then.
 RPC_URL        = os.environ.get("RPC_URL", "https://api.mainnet-beta.solana.com")
 PRIVATE_KEY    = os.environ.get("PRIVATE_KEY", "")   # dedicated trading wallet, base58
-JUP_API_KEY    = os.environ.get("JUP_API_KEY", "")   # free from portal.jup.ag (live only)
+
+# ── Jupiter ─────────────────────────────────────────────────────────────────
+# A key is free from portal.jup.ag and you want one: prices come from Jupiter
+# quotes, and without a key you are sharing a very small public allowance.
+JUP_API_KEY    = os.environ.get("JUP_API_KEY", "")
+JUP_HOST       = os.environ.get("JUP_HOST", "https://api.jup.ag/swap/v1")
+
+# Requests per second across ALL watched coins combined — not per coin.
+# Each coin polls once a second, so watching 3 coins needs 3 rps. Above your
+# allowance Jupiter answers 429, which arrives as an empty quote and reads to the
+# strategy as "no price": it then waits forever without ever erroring. Keep this
+# at or under what your key actually allows.
+# Measured against Jupiter with no key: 1 req/s is ~50% rate-limited, 1 req/2s
+# is 100% clean. So 0.5 rps is the honest ceiling without a key — and that is
+# ONE coin at 2-second resolution. A free key from portal.jup.ag raises this a
+# lot, and you want one before watching several coins at once.
+JUP_MAX_RPS    = float(os.environ.get("JUP_MAX_RPS", "8" if os.environ.get("JUP_API_KEY") else "0.5"))
+JUP_COOLDOWN   = 20.0    # seconds to back off after a 429 before trying again
 
 # ── where state lives ───────────────────────────────────────────────────────
 # Open positions are written here after every change so a crash or restart

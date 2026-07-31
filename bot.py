@@ -422,6 +422,7 @@ async def work_coin(s, sig):
         f"Stands down after {int(C.ENTRY_TIMEOUT/60)} min if no setup appears.</i>")
 
     t0 = time.time()
+    dead_polls = 0      # consecutive polls with no price back
     tokens_held = 0
     entry_px = None
     spent = 0.0
@@ -444,6 +445,23 @@ async def work_coin(s, sig):
                 break
 
             price = await J.get_price(s, mint)
+
+            # A dead price feed is indistinguishable from a quiet coin: the
+            # strategy just never sees a dip and waits out the clock. Say so
+            # rather than looking busy while receiving nothing.
+            if price is None:
+                dead_polls += 1
+                if dead_polls == 30:
+                    await tg_send(
+                        s, f"⚠️ <b>{name}</b> — no price coming back from Jupiter.\n"
+                           f"Nothing can trigger without prices. Usually rate limiting: "
+                           f"set <code>JUP_API_KEY</code> (free at portal.jup.ag) or watch "
+                           f"fewer coins at once.")
+                    print(f"NO PRICE {name}: 30 consecutive failed quotes", flush=True)
+            elif dead_polls:
+                if dead_polls >= 30:
+                    await tg_send(s, f"✅ <b>{name}</b> — price feed recovered.")
+                dead_polls = 0
 
             # ── fill whatever was decided on the PREVIOUS poll ──────────────
             # Real trades don't fill at the price that triggered them. By the time
