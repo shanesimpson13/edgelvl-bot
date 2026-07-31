@@ -45,8 +45,23 @@ async def tg_send(s, text, buttons=None):
         return {}
 
 
+async def tg_edit(s, chat_id, message_id, text, buttons=None):
+    """Edit a message in place — lets the board and a coin share one message
+    instead of burying you in new ones."""
+    payload = {"chat_id": chat_id, "message_id": message_id, "text": text,
+               "parse_mode": "HTML", "disable_web_page_preview": True}
+    if buttons:
+        payload["reply_markup"] = json.dumps({"inline_keyboard": buttons})
+    try:
+        async with s.post(f"{TG}/editMessageText", json=payload) as r:
+            return await r.json()
+    except Exception as e:
+        print(f"tg edit error: {e}")
+        return {}
+
+
 async def tg_poll_taps(s, offset):
-    """Watch for your GREENLIGHT taps."""
+    """Watch for your commands and button taps."""
     try:
         async with s.get(f"{TG}/getUpdates",
                          params={"offset": offset, "timeout": 5},
@@ -57,6 +72,21 @@ async def tg_poll_taps(s, offset):
 
     for upd in data.get("result", []):
         offset = upd["update_id"] + 1
+
+        # ── typed commands ──────────────────────────────────────────────
+        msg = upd.get("message")
+        if msg:
+            if str(msg.get("from", {}).get("id")) != str(C.TG_CHAT):
+                continue
+            text = (msg.get("text") or "").strip().lower().split("@")[0]
+            if text in ("/top", "/board", "/start"):
+                await show_board(s)
+            elif text == "/help":
+                await tg_send(s, HELP_TEXT)
+            elif text == "/positions":
+                await show_positions(s)
+            continue
+
         cb = upd.get("callback_query")
         if not cb:
             continue
@@ -66,14 +96,117 @@ async def tg_poll_taps(s, offset):
             continue
 
         data_str = cb.get("data", "")
+        chat_id = cb["message"]["chat"]["id"]
+        msg_id = cb["message"]["message_id"]
+
         async with s.post(f"{TG}/answerCallbackQuery",
                           json={"callback_query_id": cb["id"]}):
             pass
 
         if data_str.startswith("go:"):
-            mint = data_str[3:]
-            await arm_mint(s, mint)
+            await arm_mint(s, data_str[3:])
+        elif data_str.startswith("coin:"):
+            await show_coin(s, data_str[5:], chat_id, msg_id)
+        elif data_str == "board":
+            await show_board(s, chat_id, msg_id)
     return offset
+
+
+HELP_TEXT = (
+    "<b>Commands</b>\n\n"
+    "/top — the coins worth a look right now\n"
+    "/positions — what the bot is holding\n"
+    "/help — this\n\n"
+    "Tap a coin on the board to see it, then <b>GREENLIGHT</b> to hand it to the bot."
+)
+
+
+async def fetch_board(s, hours=6, limit=40):
+    """Recent signals with live market data attached."""
+    try:
+        async with s.get(f"{C.EDGE_API}/api/terminal",
+                         params={"hours": hours, "limit": limit},
+                         headers={"Authorization": f"Bearer {C.EDGE_API_KEY}"},
+                         timeout=aiohttp.ClientTimeout(total=20)) as r:
+            if r.status != 200:
+                return []
+            return (await r.json()).get("coins", [])
+    except Exception as e:
+        print(f"board error: {e}")
+        return []
+
+
+def _live_coins(coins, top=5):
+    """The ones still moving, freshest first.
+
+    `state` says whether the coin is still showing up in the trending feed the
+    signal engine polls. A coin that's dropped out isn't being traded any more,
+    so it doesn't belong on a board about what to do next.
+    """
+    live = [c for c in coins if c.get("state") in ("hot", "cooling")]
+    live.sort(key=lambda c: -(c.get("alert_time") or 0))
+    return live[:top]
+
+
+async def show_board(s, chat_id=None, msg_id=None):
+    """The whole point: a handful of coins, not a scroll of cards."""
+    coins = _live_coins(await fetch_board(s))
+
+    if not coins:
+        text = ("<b>Nothing live right now.</b>\n\n"
+                "No recent signal is still trending. That's a normal state — "
+                "it means there's nothing worth forcing.")
+        buttons = [[{"text": "↻ Refresh", "callback_data": "board"}]]
+    else:
+        lines = ["<b>Worth a look</b>  ·  still trending\n"]
+        buttons = []
+        for c in coins:
+            name = c.get("name") or c.get("mint", "")[:8]
+            age = (time.time() - (c.get("alert_time") or time.time())) / 60
+            mc = c.get("current_mcap") or 0
+            alert_mc = c.get("alert_mcap") or 0
+            move = f"  ·  {mc/alert_mc:.1f}x since alert" if alert_mc and mc else ""
+            dot = "🟢" if c.get("state") == "hot" else "🟡"
+            lines.append(f"{dot} <b>{name}</b> — {_money(mc)}{move}"
+                         f"\n     alerted {age:.0f}m ago")
+            buttons.append([{"text": f"{name}  ·  {_money(mc)}",
+                             "callback_data": f"coin:{c['mint']}"}])
+        text = "\n".join(lines)
+        buttons.append([{"text": "↻ Refresh", "callback_data": "board"}])
+
+    if msg_id:
+        await tg_edit(s, chat_id, msg_id, text, buttons)
+    else:
+        await tg_send(s, text, buttons)
+
+
+async def show_coin(s, mint, chat_id, msg_id):
+    """One coin, in place, with the greenlight."""
+    coins = await fetch_board(s)
+    sig = next((c for c in coins if c.get("mint") == mint), None)
+    if sig is None:
+        sig = await lookup_signal(s, mint)
+    if sig is None:
+        await tg_edit(s, chat_id, msg_id,
+                      "Couldn't load that coin — it may have aged out of the feed.",
+                      [[{"text": "← Back", "callback_data": "board"}]])
+        return
+
+    pending_tap[mint] = sig
+    await tg_edit(s, chat_id, msg_id, signal_card(sig), [
+        [{"text": "🟢 GREENLIGHT", "callback_data": f"go:{mint}"}],
+        [{"text": "← Back", "callback_data": "board"}],
+    ])
+
+
+async def show_positions(s):
+    if not open_positions:
+        await tg_send(s, "Not holding anything.")
+        return
+    lines = ["<b>Open positions</b>\n"]
+    for m, p in open_positions.items():
+        lines.append(f"• <b>{p.get('name', m[:8])}</b> — {int(p.get('tokens_raw', 0)):,} tokens")
+    await tg_send(s, "\n".join(lines))
 
 
 async def arm_mint(s, mint):
@@ -179,8 +312,10 @@ async def offer_signals(s):
                 pending_tap[mint] = sig
                 S.save(open_positions, seen_signals)
 
-                await tg_send(s, signal_card(sig),
-                              [[{"text": "🟢 GREENLIGHT", "callback_data": f"go:{mint}"}]])
+                # Quiet by default — the board is where you decide. See config.
+                if C.PUSH_EVERY_SIGNAL:
+                    await tg_send(s, signal_card(sig),
+                                  [[{"text": "🟢 GREENLIGHT", "callback_data": f"go:{mint}"}]])
         except Exception as e:
             print(f"offer error: {e}")
         await asyncio.sleep(C.FEED_POLL_SEC)
@@ -458,8 +593,21 @@ async def main():
     print(f"edgelvl bot up · {mode} · {C.SIZE_SOL} SOL/trade · poll {C.POLL_SEC}s")
 
     async with aiohttp.ClientSession() as s:
+        # Puts /top in Telegram's own command menu, so it's discoverable
+        # without reading any documentation.
+        try:
+            await s.post(f"{TG}/setMyCommands", json={"commands": [
+                {"command": "top", "description": "Coins worth a look right now"},
+                {"command": "positions", "description": "What the bot is holding"},
+                {"command": "help", "description": "How this works"},
+            ]})
+        except Exception:
+            pass
+
         await tg_send(s, f"⚡ <b>Bot online</b> — {mode}\n"
-                         f"{C.SIZE_SOL} SOL per trade · TP {C.TPS[0]}x/{C.TPS[1]}x")
+                         f"{C.SIZE_SOL} SOL per trade · TP {C.TPS[0]}x/{C.TPS[1]}x\n\n"
+                         f"Send /top when you're ready to trade.",
+                      [[{"text": "📋 Show the board", "callback_data": "board"}]])
 
         # ── did we come back holding something? ─────────────────────────────
         # If the bot died mid-trade, those positions are still in your wallet
