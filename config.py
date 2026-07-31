@@ -50,10 +50,29 @@ BOUNCE         = 1.04    # then +4% up off that dip low = the reclaim trigger
 DEADCAT        = 0.50    # skip if price is >50% below the running peak (falling knife)
 PICO           = 0.90    # skip if the bounce is already within 10% of the high
                          #   (that's a pico-top entry — wait for a lower one)
-SLOPE_WIN      = 300     # slope window in POLLS. At 1s polling = a 5-minute window.
 SLOPE_TOL      = 0.02    # allow 2% droop before calling the trend "rolling over"
-WARMUP         = 250     # polls to observe before ANY entry (~4 min). Stops you buying
-                         #   into a coin you've only seen 3 seconds of.
+
+# The strategy was validated counting SWAPS, not seconds — 250 swaps of evidence
+# before entry, a 300-swap slope window. We poll once a second rather than read
+# every swap, so these are converted at runtime using the coin's real swap rate
+# (from the board's 5m transaction count).
+#
+# Why it matters: a coin doing 4,000 swaps per 5 minutes hits 250 swaps in ~18
+# seconds. Reading "250" as 250 polls means waiting 4 minutes — on a coin moving
+# that fast, the move is over before you're allowed to look.
+WARMUP_SWAPS   = 250
+SLOPE_SWAPS    = 300
+
+# Clamps, so a frantic coin still gets a few seconds of observation and a quiet
+# one doesn't wait all day.
+WARMUP_MIN     = 10      # polls (~10s)
+WARMUP_MAX     = 250     # polls (~4 min)
+SLOPE_MIN      = 15
+SLOPE_MAX      = 300
+
+# Used only when the swap rate is unknown.
+WARMUP         = 250
+SLOPE_WIN      = 300
 
 # ── the board ───────────────────────────────────────────────────────────────
 # /top shows Solana's 5m-trending coins ranked by real trailing 5m volume.

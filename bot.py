@@ -392,7 +392,13 @@ async def work_coin(s, sig):
     mint = sig["mint"]
     name = sig.get("name", mint[:8])
     volr = sig.get("volr")
-    sess = Session(mint, name, volr=volr if isinstance(volr, (int, float)) else None)
+    # 5m transaction count -> swaps per second, which sets how long the strategy
+    # watches before it's allowed to enter. Fast coins get a short warmup.
+    swaps_5m = sig.get("swaps_5m")
+    sps = (swaps_5m / 300.0) if isinstance(swaps_5m, (int, float)) and swaps_5m > 0 else None
+    sess = Session(mint, name,
+                   volr=volr if isinstance(volr, (int, float)) else None,
+                   swaps_per_sec=sps)
     live_sessions[mint] = sess
 
     blocked = sess.blocked_reason()

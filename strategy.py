@@ -22,11 +22,21 @@ import config as C
 class Session:
     """One coin, one greenlight, from tap to flat."""
 
-    def __init__(self, mint, name, volr=None):
+    def __init__(self, mint, name, volr=None, swaps_per_sec=None):
         self.mint, self.name = mint, name
-        self.volr = volr                  # from the signal feed; None if unknown
+        self.volr = volr                  # buy vol / sell vol over the last 5m
 
-        self.prices = deque(maxlen=C.SLOPE_WIN)
+        # The original strategy counted SWAPS, not seconds: it needed 250 swaps of
+        # evidence before entering and a 300-swap slope window. We poll once a
+        # second instead of reading every swap, so those windows have to be
+        # converted using how fast the coin is actually trading.
+        #
+        # It matters enormously. A coin doing 4,000 swaps per 5 minutes reaches
+        # 250 swaps in ~18 seconds; treating "250" as 250 polls would make you
+        # wait 4 minutes — long enough for the whole move on a coin this fast.
+        self.warmup, self.slope_win = self._windows(swaps_per_sec)
+
+        self.prices = deque(maxlen=self.slope_win)
         self.win = deque(maxlen=5)        # median-5 smoothing: ignores single-poll noise
         self.n = 0                        # polls seen
 
@@ -41,16 +51,35 @@ class Session:
         self.tp_done = 0                  # how many ladder rungs have fired
 
     # ── helpers ─────────────────────────────────────────────────────────────
+    @staticmethod
+    def _windows(swaps_per_sec):
+        """Convert the strategy's swap-count windows into poll counts.
+
+        Returns (warmup_polls, slope_window_polls). With no rate available we
+        fall back to the configured defaults.
+
+        Both are clamped: fast coins still get a few seconds of observation
+        rather than firing on the second poll, and slow ones don't wait forever.
+        """
+        if not swaps_per_sec or swaps_per_sec <= 0:
+            return C.WARMUP, C.SLOPE_WIN
+
+        polls_per_swap = 1.0 / (swaps_per_sec * C.POLL_SEC)
+        warmup = int(C.WARMUP_SWAPS * polls_per_swap)
+        slope = int(C.SLOPE_SWAPS * polls_per_swap)
+        return (max(C.WARMUP_MIN, min(C.WARMUP_MAX, warmup)),
+                max(C.SLOPE_MIN, min(C.SLOPE_MAX, slope)))
+
     def _smooth(self):
         """Median of the last 5 polls. One bad print can't move this."""
         return statistics.median(self.win) if len(self.win) >= 3 else self.win[-1]
 
     def _trend_ok(self):
         """Is the recent half of the window still >= the older half? (not rolling over)"""
-        if len(self.prices) < C.SLOPE_WIN:
+        if len(self.prices) < self.slope_win:
             return True                   # not enough history yet — don't block on it
         seg = list(self.prices)
-        h = C.SLOPE_WIN // 2
+        h = self.slope_win // 2
         older = sum(seg[:h]) / h
         recent = sum(seg[h:]) / h
         return recent >= older * (1 - C.SLOPE_TOL)
@@ -108,7 +137,7 @@ class Session:
             return None
 
         # 4. bounce confirmed — now the filters
-        if self.n < C.WARMUP:
+        if self.n < self.warmup:
             return None                                    # haven't watched it long enough
         if not self._trend_ok():
             return None                                    # trend rolling over, skip

@@ -74,4 +74,32 @@ print("PASS 7 · warmup enforced")
 s, _ = drive(RUNWAY + [84.0, 130.0, 250.0])
 print(f"PASS 8 · peak_after_tap = {s.peak_since_tap():.2f}x")
 
+
+
+def test_swap_rate_windows():
+    """Swap-count windows must scale with how fast the coin actually trades.
+
+    The strategy was validated on 250 SWAPS of evidence, not 250 seconds. On a
+    coin doing 4,000 swaps per 5 minutes that's ~18s; treating it as 250 polls
+    would sit out the entire move.
+    """
+    fast = Session("m", "fast", swaps_per_sec=4088 / 300)     # a live trending coin
+    slow = Session("m", "slow", swaps_per_sec=150 / 300)
+    unknown = Session("m", "unknown")
+
+    assert fast.warmup < 30, f"fast coin warmup {fast.warmup} should be seconds, not minutes"
+    assert slow.warmup == C.WARMUP_MAX, f"slow coin should keep the full warmup, got {slow.warmup}"
+    assert unknown.warmup == C.WARMUP, "no rate -> configured default"
+    assert fast.warmup >= C.WARMUP_MIN, "clamp: never fire on the second poll"
+    assert fast.slope_win >= C.SLOPE_MIN
+
+    # and the fast coin must actually be able to enter inside its warmup budget
+    px = [100.0] * fast.warmup + [100.0, 84.0, 88.0]
+    got = [fast.feed(p) for p in px]
+    assert ("BUY",) in got, "fast coin should be able to enter after its short warmup"
+    print(f"PASS 9 · warmup scales with swap rate "
+          f"(fast={fast.warmup} polls, slow={slow.warmup}, unknown={unknown.warmup})")
+
+
+test_swap_rate_windows()
 print("\nALL STRATEGY TESTS PASSED")
