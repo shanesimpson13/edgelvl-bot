@@ -500,6 +500,10 @@ async def work_coin(s, sig):
     if blocked:
         await tg_send(s, f"🛑 <b>{name}</b> skipped — {blocked}")
         live_sessions.pop(mint, None)
+        # This returns before the cleanup below, so drop it here too — otherwise
+        # a blocked coin sits in the armed set and re-blocks on every restart.
+        armed_mints.discard(mint)
+        S.save(open_positions, seen_signals, armed_mints)
         return
 
     mode = "DRY RUN" if C.DRY_RUN else "🔴 LIVE"
