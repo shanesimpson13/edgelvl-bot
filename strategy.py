@@ -62,6 +62,8 @@ class Session:
         self.win = deque(maxlen=5)        # median-5 smoothing: ignores single-poll noise
         self.n = 0                        # polls seen
 
+        self.raw_tap = None               # first RAW price — the measurement baseline
+        self.raw_peak = None              # highest RAW price since tap
         self.hi = None                    # rolling high since tap
         self.low = None                   # lowest price during the current dip
         self.peak = None                  # highest smoothed price since tap
@@ -144,6 +146,14 @@ class Session:
         self.n += 1
         sp = self._smooth()
 
+        # Measurement uses the RAW price. Smoothing exists so a one-second wick
+        # can't trigger a trade — but it also erases the spike entirely, and a
+        # coin that really ran 3x would report 1.4x. Trade on smoothed, measure
+        # on real.
+        if self.raw_tap is None:
+            self.raw_tap = self.raw_peak = price
+        self.raw_peak = max(self.raw_peak, price)
+
         if self.hi is None:
             self.hi = self.peak = self.tap_px = sp
         self.hi = max(self.hi, sp)
@@ -213,8 +223,11 @@ class Session:
 
     # ── reporting ───────────────────────────────────────────────────────────
     def peak_since_tap(self):
-        """How far it ran after you tapped. This measures YOUR SELECTION,
-        independently of whether the strategy captured it. Module 05 lives on this."""
-        if not self.tap_px or not self.peak:
+        """How far it actually ran after you tapped — your selection, measured
+        independently of whether the strategy captured it.
+
+        Raw prices, not smoothed: this is a measurement, not a trade trigger.
+        """
+        if not self.raw_tap or not self.raw_peak:
             return None
-        return self.peak / self.tap_px
+        return self.raw_peak / self.raw_tap
