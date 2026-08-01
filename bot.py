@@ -296,6 +296,34 @@ async def fetch_settings(s):
         return {}
 
 
+def _band(sess, MC):
+    """The market caps that would actually fire a buy.
+
+    Not just "dip then reclaim". The dip branch swallows every price at or below
+    hi*(1-DIP) and returns before the reclaim is even considered, so a bounce off
+    a deep low does nothing until price climbs back above that line. The window
+    that really fires is:
+
+        max(hi*(1-DIP), low*BOUNCE)   <   price   <   peak*PICO
+
+    which on a coin that fell hard is a long way above where it is now.
+    """
+    if not sess.hi or not sess.peak:
+        return None
+    floor = sess.hi * (1 - sess.dip)
+    if sess.low:
+        floor = max(floor, sess.low * sess.bounce)
+    ceiling = sess.peak * sess.pico
+    return {
+        "hi": MC(sess.hi),
+        "buy_from": MC(floor),
+        "buy_to": MC(ceiling),
+        "reachable": floor < ceiling,
+        "dipped": sess.low is not None,
+        "warmup_left": max(0, sess.warmup - sess.n),
+    }
+
+
 async def report_status(s, mint, name, state, mc, pnl_frac, mult=None, open_pct=None, band=None):
     """Tell the terminal what the bot just did.
 
@@ -615,13 +643,7 @@ async def work_coin(s, sig):
                 last_band = time.time()
                 await report_status(
                     s, mint, name, "watching", MC(price), None,
-                    band={
-                        "hi": MC(sess.hi / 1) if sess.hi else None,
-                        "dip": MC(sess.hi * (1 - sess.dip)) if sess.hi else None,
-                        "reclaim": MC(sess.low * sess.bounce) if sess.low else None,
-                        "ceiling": MC(sess.peak * sess.pico) if sess.peak else None,
-                        "warmup_left": max(0, sess.warmup - sess.n),
-                    })
+                    band=_band(sess, MC))
 
             # ── fill whatever was decided on the PREVIOUS poll ──────────────
             # Real trades don't fill at the price that triggered them. By the time
