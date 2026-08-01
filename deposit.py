@@ -1,9 +1,19 @@
 """
 deposit.py — fund a trading wallet with WSOL, signed entirely by YOU.
 
-    FUNDER_KEY=<base58 secret> python deposit.py <destination> <sol amount>
+    FUNDER_KEY=<base58 secret> python deposit.py <destination> <sol amount> [--wsol]
 
-WHY IT LOOKS LIKE THIS
+PLAIN SOL BY DEFAULT
+  Send ordinary SOL and stop. The trading wallet wraps its own balance under a
+  policy that only permits wrapping into its own account, and it holds back a
+  reserve for fees. Depositing pure WSOL instead would leave it with no native
+  SOL at all, so it couldn't pay for a single transaction — including the ones
+  that would fix it.
+
+  --wsol does the wrapped version below. Useful when the destination can't wrap
+  for itself; wrong for a normal deposit.
+
+WHY --wsol LOOKS LIKE THIS
   The trading wallet's policy has no System Program, so it cannot wrap SOL —
   that omission is the custody guarantee and we don't want to weaken it just to
   make a deposit convenient. So the deposit happens the other way round: your
@@ -75,6 +85,9 @@ def sync_native(account):
 
 
 def main():
+    as_wsol = "--wsol" in sys.argv
+    if as_wsol:
+        sys.argv.remove("--wsol")
     if len(sys.argv) != 3:
         print(__doc__)
         return 1
@@ -93,10 +106,10 @@ def main():
     print(f"from    {funder.pubkey()}  ({bal/1e9:.6f} SOL)")
     print(f"to      {dest}")
     print(f"  its WSOL account: {dest_wsol}")
-    print(f"amount  {lamports/1e9} SOL -> WSOL\n")
+    print(f"amount  {lamports/1e9} SOL" + (" -> WSOL" if as_wsol else " (plain)") + "\n")
 
     # Leave room for rent on the token account (~0.00204 SOL) and the fee.
-    if bal < lamports + 3_000_000:
+    if bal < lamports + (3_000_000 if as_wsol else 10_000):
         print(f"Not enough SOL. Need ~{(lamports + 3_000_000)/1e9:.4f} including "
               f"rent and fees, have {bal/1e9:.6f}.")
         return 1
@@ -108,12 +121,18 @@ def main():
     bh = rpc("getLatestBlockhash", [{"commitment": "finalized"}])
     blockhash = Hash.from_string(bh["result"]["value"]["blockhash"])
 
-    ixs = [
-        create_ata_idempotent(funder.pubkey(), dest, WSOL, dest_wsol),
-        transfer(TransferParams(from_pubkey=funder.pubkey(),
-                                to_pubkey=dest_wsol, lamports=lamports)),
-        sync_native(dest_wsol),
-    ]
+    if as_wsol:
+        ixs = [
+            create_ata_idempotent(funder.pubkey(), dest, WSOL, dest_wsol),
+            transfer(TransferParams(from_pubkey=funder.pubkey(),
+                                    to_pubkey=dest_wsol, lamports=lamports)),
+            sync_native(dest_wsol),
+        ]
+    else:
+        # Ordinary SOL. The destination wraps what it needs and keeps the rest
+        # for fees — which is the only way it ends up able to trade.
+        ixs = [transfer(TransferParams(from_pubkey=funder.pubkey(),
+                                       to_pubkey=dest, lamports=lamports))]
     tx = Transaction([funder], Message.new_with_blockhash(
         ixs, funder.pubkey(), blockhash), blockhash)
 
