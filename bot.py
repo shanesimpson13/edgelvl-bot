@@ -40,9 +40,15 @@ async def tg_send(s, text, buttons=None):
         payload["reply_markup"] = json.dumps({"inline_keyboard": buttons})
     try:
         async with s.post(f"{TG}/sendMessage", json=payload) as r:
-            return await r.json()
+            d = await r.json()
+        # Telegram answers 200 with ok:false for throttling and bad markup.
+        # Swallowing that means a message you needed just never arrives.
+        if not d.get("ok"):
+            print(f"TG SEND FAILED: {d.get('error_code')} {d.get('description')} "
+                  f"| text was: {text[:80]}", flush=True)
+        return d
     except Exception as e:
-        print(f"tg error: {e}")
+        print(f"tg error: {e}", flush=True)
         return {}
 
 
