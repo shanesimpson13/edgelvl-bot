@@ -11,16 +11,38 @@ import time
 
 import aiohttp
 from solders.keypair import Keypair
+from solders.pubkey import Pubkey
 from solders.transaction import VersionedTransaction
 
 import config as C
+import privy
 
 JUP = C.JUP_HOST
 WSOL = "So11111111111111111111111111111111111111112"
+TOKEN_PROGRAM = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+ATA_PROGRAM = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
 
-# Wallet is only needed for live trading. In dry run there's no key and no signing.
+# Signing is only needed for live trading. In dry run there's no wallet at all.
+#
+# Two backends, same interface: a local keypair (self-hosted — you hold your own
+# key) or Privy (hosted terminal — nobody holds the customer's key, and the
+# wallet's policy makes a transfer impossible rather than merely disallowed).
 kp = Keypair.from_base58_string(C.PRIVATE_KEY) if C.PRIVATE_KEY else None
-ME = str(kp.pubkey()) if kp else None
+WALLET = privy.build(kp)
+ME = WALLET.address if WALLET else None
+
+
+def ata(owner, mint):
+    """The associated token account address for (owner, mint).
+
+    Deterministic, so the WSOL account holding a trading balance can always be
+    derived rather than stored.
+    """
+    o = owner if isinstance(owner, Pubkey) else Pubkey.from_string(owner)
+    m = mint if isinstance(mint, Pubkey) else Pubkey.from_string(mint)
+    addr, _ = Pubkey.find_program_address(
+        [bytes(o), bytes(TOKEN_PROGRAM), bytes(m)], ATA_PROGRAM)
+    return str(addr)
 
 # ── request pacing ──────────────────────────────────────────────────────────
 # Every watched coin polls once a second, so N coins means N requests a second.
@@ -130,12 +152,25 @@ async def token_balance(s, mint):
     return int(accs[0]["account"]["data"]["parsed"]["info"]["tokenAmount"]["amount"])
 
 
+def programs_in(tx_b64):
+    """Every top-level program a transaction calls. Used to check our own work."""
+    tx = VersionedTransaction.from_bytes(base64.b64decode(tx_b64))
+    keys = list(tx.message.account_keys)
+    out = []
+    for ix in tx.message.instructions:
+        if ix.program_id_index < len(keys):
+            out.append(str(keys[ix.program_id_index]))
+    return out
+
+
 async def _send(s, q):
     """Build a swap from a quote, sign it, send it, wait for confirmation."""
     body = {
         "quoteResponse": q,
         "userPublicKey": ME,
-        "wrapAndUnwrapSol": True,
+        # A Privy wallet can't wrap SOL — the policy has no System Program — so
+        # its swaps spend WSOL directly. A local key wraps as normal.
+        "wrapAndUnwrapSol": WALLET.wrap_sol,
         "dynamicComputeUnitLimit": True,
         "prioritizationFeeLamports": {
             "priorityLevelWithMaxLamports": {
@@ -149,9 +184,18 @@ async def _send(s, q):
     if not sj.get("swapTransaction"):
         return None, f"build_failed:{str(sj)[:80]}"
 
-    raw = VersionedTransaction.from_bytes(base64.b64decode(sj["swapTransaction"]))
-    signed = VersionedTransaction(raw.message, [kp])
-    b64 = base64.b64encode(bytes(signed)).decode()
+    # Check before asking Privy, not because Privy would let it through, but so
+    # a build that drifts out of policy fails here with a readable reason
+    # instead of an opaque refusal. Belt and braces, cheap.
+    if not WALLET.wrap_sol:
+        stray = [p for p in programs_in(sj["swapTransaction"])
+                 if p not in privy.SWAP_PROGRAMS]
+        if stray:
+            return None, f"unexpected_program:{stray[0][:12]}"
+
+    b64, err = await WALLET.sign(s, sj["swapTransaction"])
+    if err:
+        return None, err
 
     send = await rpc(s, "sendTransaction",
                      [b64, {"encoding": "base64", "skipPreflight": True, "maxRetries": 5}])
@@ -187,11 +231,57 @@ async def buy(s, mint, sol_amount):
 
 
 async def sell(s, mint, raw_amount):
-    """Sell `raw_amount` raw tokens back to SOL. Returns (sig, error)."""
+    """Sell `raw_amount` raw tokens back to SOL. Returns (sig, out_lamports, error)."""
     if raw_amount <= 0:
-        return None, "nothing_to_sell"
+        return None, 0, "nothing_to_sell"
     q = await quote(s, mint, WSOL, int(raw_amount), with_fee=True)
-    if not q.get("outAmount"):
-        return None, "no_route"
+    out = int(q.get("outAmount", 0) or 0)
+    if out <= 0:
+        return None, 0, "no_route"
     sig, err = await _send(s, q)
-    return sig, (err if err and err != "unconfirmed" else None)
+    return sig, out, (err if err and err != "unconfirmed" else None)
+
+
+async def wsol_balance(s):
+    """The trading balance, in SOL.
+
+    On a Privy wallet this is the number that matters — native SOL sitting in
+    the account can't be spent by the bot, only wrapped WSOL can. Returns None
+    if the account doesn't exist yet (nothing has been deposited or wrapped).
+    """
+    if not ME:
+        return None
+    r = await rpc(s, "getTokenAccountBalance", [ata(ME, WSOL)])
+    v = (r.get("result") or {}).get("value")
+    return (int(v["amount"]) / 1e9) if v else None
+
+
+# ── the one entry point the bot calls ───────────────────────────────────────
+# Local keypairs keep using Jupiter Ultra: it routes, submits and confirms in
+# one call, and it's the path that's been trading. Ultra builds the transaction
+# server-side though, so it always wraps SOL — which a Privy wallet's policy
+# refuses. Privy therefore goes through the swap API, where we control the build.
+async def execute_buy(s, mint, sol_amount):
+    """Spend SOL (or WSOL) on `mint`. Returns (tokens_received, error)."""
+    if WALLET is None:
+        return 0, "no_wallet"
+    if WALLET.kind == "local":
+        import ultra as U
+        sig, got = await U.ultra_swap(s, WSOL, mint, int(sol_amount * 1e9),
+                                      WALLET.kp, C.JUP_API_KEY)
+        return (got, None) if (sig and got > 0) else (0, "swap_failed")
+    sig, got, err = await buy(s, mint, sol_amount)
+    return (got, err) if err else (got, None)
+
+
+async def execute_sell(s, mint, raw_amount):
+    """Sell tokens back to SOL/WSOL. Returns (sol_out, error)."""
+    if WALLET is None:
+        return 0.0, "no_wallet"
+    if WALLET.kind == "local":
+        import ultra as U
+        sig, out = await U.ultra_swap(s, mint, WSOL, int(raw_amount),
+                                      WALLET.kp, C.JUP_API_KEY)
+        return (out / 1e9, None) if sig else (0.0, "swap_failed")
+    sig, out, err = await sell(s, mint, raw_amount)
+    return (0.0, err) if err else (out / 1e9, None)

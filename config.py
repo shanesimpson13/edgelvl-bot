@@ -17,6 +17,33 @@ TG_CHAT        = os.environ["TELEGRAM_CHAT_ID"]      # your user id, from @useri
 RPC_URL        = os.environ.get("RPC_URL", "https://api.mainnet-beta.solana.com")
 PRIVATE_KEY    = os.environ.get("PRIVATE_KEY", "")   # dedicated trading wallet, base58
 
+# ── Privy: trading without holding a key ────────────────────────────────────
+# Set these and the bot stops using PRIVATE_KEY entirely. It builds swaps and
+# asks Privy to sign them; Privy checks the wallet's policy first. The policy
+# allows Jupiter and leaves the System Program off the allow-list, so a SOL
+# transfer isn't blocked — it's unrepresentable. Verified in test_privy.py.
+#
+# The trade-off, so it isn't a surprise later: no System Program means the bot
+# can't wrap SOL, so the trading balance lives as WSOL and cycles
+# WSOL -> token -> WSOL. Deposits get wrapped once; withdrawals are signed by
+# the wallet's owner in the terminal, never by us.
+PRIVY_APP_ID         = os.environ.get("PRIVY_APP_ID", "")
+PRIVY_APP_SECRET     = os.environ.get("PRIVY_APP_SECRET", "")
+PRIVY_WALLET_ID      = os.environ.get("PRIVY_WALLET_ID", "")
+PRIVY_WALLET_ADDRESS = os.environ.get("PRIVY_WALLET_ADDRESS", "")
+
+# OUR signing key — a P-256 keypair, base64 PKCS8 with no PEM headers. This is
+# what makes us a signer on a customer's wallet. It is NOT a wallet key and
+# cannot move funds on its own; what it can do is bounded by the policy the
+# customer owns. Generate one with: node -e "require('@privy-io/node')
+#   .generateP256KeyPair().then(k => console.log(JSON.stringify(k)))"
+PRIVY_AUTH_PRIVATE_KEY = os.environ.get("PRIVY_AUTH_PRIVATE_KEY", "")
+PRIVY_AUTH_PUBLIC_KEY  = os.environ.get("PRIVY_AUTH_PUBLIC_KEY", "")
+
+# The programs a swap may touch are defined in privy.py, next to the policy rule
+# that enforces them — see privy.SWAP_PROGRAMS. Keeping the list in one place
+# means the check we run before signing can't drift from the rule Privy applies.
+
 # ── Jupiter ─────────────────────────────────────────────────────────────────
 # A key is free from portal.jup.ag and you want one: prices come from Jupiter
 # quotes, and without a key you are sharing a very small public allowance.
