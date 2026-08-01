@@ -67,7 +67,7 @@ async def main():
     bot = p256_keypair()           # us
 
     async with aiohttp.ClientSession() as s:
-        w, err = await privy.provision(s, user["publicKey"], bot["publicKey"], bot["privateKey"])
+        w, err = await privy.provision(s, {"public_key": user["publicKey"]}, bot["publicKey"], bot["privateKey"])
         if err:
             print(f"could not provision a test wallet: {err}")
             return 1

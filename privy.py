@@ -178,8 +178,14 @@ class PrivyWallet:
         return (signed, None) if signed else (None, "privy_no_signature")
 
 
-async def provision(s, user_public_key, bot_public_key=None, bot_private_key=None):
+async def provision(s, owner, bot_public_key=None, bot_private_key=None):
     """Create a wallet the customer owns and we can only trade.
+
+    `owner` is how the customer is identified to Privy, and there are two forms.
+    In production it's {"user_id": "did:privy:…"} — they signed in with an email
+    and Privy holds their key against that login, so losing a device means
+    logging in again rather than losing the wallet. {"public_key": …} is the
+    raw-key form, used by the tests.
 
     Ordering is forced by a chicken-and-egg: the wrap rule has to name the
     wallet's WSOL account, which can't be derived until the wallet exists. So we
@@ -191,9 +197,12 @@ async def provision(s, user_public_key, bot_public_key=None, bot_private_key=Non
     """
     import jupiter as J          # local import: jupiter imports this module
 
+    if isinstance(owner, str):
+        owner = ({"user_id": owner} if owner.startswith("did:privy:")
+                 else {"public_key": owner})
     bot_public_key = bot_public_key or C.PRIVY_AUTH_PUBLIC_KEY
     bot_private_key = bot_private_key or C.PRIVY_AUTH_PRIVATE_KEY
-    if not (user_public_key and bot_public_key and bot_private_key):
+    if not (owner and bot_public_key and bot_private_key):
         # Without our private key we can't authorise steps 4-6, and the wallet
         # would be left half-configured and owned by nobody useful.
         return None, "missing_keys"
@@ -238,13 +247,11 @@ async def provision(s, user_public_key, bot_public_key=None, bot_private_key=Non
     #    the entire point — so it goes last, and a failure here leaves a wallet
     #    we still control rather than one nobody does.
     _, err = await _call(s, "PATCH", f"/v1/policies/{pol['id']}",
-                         {"owner": {"public_key": user_public_key}},
-                         auth_key=bot_private_key)
+                         {"owner": owner}, auth_key=bot_private_key)
     if err:
         return None, f"policy_handover:{err}"
     _, err = await _call(s, "PATCH", f"/v1/wallets/{w['id']}",
-                         {"owner": {"public_key": user_public_key}},
-                         auth_key=bot_private_key)
+                         {"owner": owner}, auth_key=bot_private_key)
     if err:
         return None, f"wallet_handover:{err}"
 
