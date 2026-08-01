@@ -508,12 +508,12 @@ async def dry_or_live_buy(s, mint, size_sol=None):
     """Returns (tokens_received, sol_spent, fill_price, error)."""
     size_sol = C.SIZE_SOL if size_sol is None else size_sol
     if not C.DRY_RUN:
-        # Ultra: order -> sign -> execute, with on-chain confirmation inline.
-        # When this returns a signature, the transaction has already landed.
-        sig, got = await U.ultra_swap(s, U.SOL_MINT, mint,
-                                      int(size_sol * 1e9), J.kp, C.JUP_API_KEY)
-        if not sig or got <= 0:
-            return 0, 0.0, 0.0, "swap_failed"
+        # Routed by wallet type: a local key goes through Jupiter Ultra, a Privy
+        # wallet through the swap API so we control the build. Either way this
+        # returns only once the swap has actually landed.
+        got, err = await J.execute_buy(s, mint, size_sol)
+        if err or got <= 0:
+            return 0, 0.0, 0.0, err or "swap_failed"
         cost = size_sol + C.GAS_SOL
         return got, cost, cost / (got / 1e6), None
 
@@ -531,11 +531,10 @@ async def dry_or_live_sell(s, mint, raw_amount):
         return 0.0, "nothing_to_sell"
 
     if not C.DRY_RUN:
-        sig, out = await U.ultra_swap(s, mint, U.SOL_MINT,
-                                      int(raw_amount), J.kp, C.JUP_API_KEY)
-        if not sig:
-            return 0.0, "swap_failed"
-        return max(0.0, out / 1e9 - C.GAS_SOL), None
+        out, err = await J.execute_sell(s, mint, raw_amount)
+        if err:
+            return 0.0, err
+        return max(0.0, out - C.GAS_SOL), None
 
     q = await J.quote(s, mint, J.WSOL, int(raw_amount))
     out = int(q.get("outAmount", 0) or 0)
@@ -832,11 +831,46 @@ async def report(s, sess, entry_px, spent, received):
 
 
 # ── main ────────────────────────────────────────────────────────────────────
+async def wallet_check(s):
+    """Say what's signing, and refuse to look ready when we aren't.
+
+    The failure this exists to prevent: bot LIVE, wallet holds native SOL, and
+    every single buy fails with no_route because a Privy wallet can only spend
+    WSOL. That looks exactly like a quiet market, and you'd never know.
+    """
+    w = J.WALLET
+    if w is None:
+        if not C.DRY_RUN:
+            print("LIVE with no wallet configured — nothing can trade.", flush=True)
+            return "⚠️ <b>No wallet configured</b> — set PRIVY_WALLET_ID or PRIVATE_KEY."
+        return None
+
+    kind = "Privy (bot holds no key)" if w.kind == "privy" else "local key"
+    print(f"wallet: {w.address} · {kind}", flush=True)
+    if C.DRY_RUN or w.kind != "privy":
+        return None
+
+    bal = await J.wsol_balance(s)
+    if bal is None:
+        return (f"⚠️ <b>No WSOL account yet</b> — nothing can be bought.\n"
+                f"Deposit SOL to <code>{w.address}</code> and wrap it, "
+                f"then restart.")
+    if bal < C.SIZE_SOL:
+        return (f"⚠️ <b>Trading balance too low</b> — {bal:.4f} WSOL, "
+                f"but trades are {C.SIZE_SOL} SOL.\n"
+                f"Top up <code>{w.address}</code>.")
+    print(f"trading balance: {bal:.4f} WSOL", flush=True)
+    return None
+
+
 async def main():
     mode = "DRY RUN — no real money" if C.DRY_RUN else "🔴 LIVE — REAL MONEY"
     print(f"edgelvl bot up · {mode} · {C.SIZE_SOL} SOL/trade · poll {C.POLL_SEC}s")
 
     async with aiohttp.ClientSession() as s:
+        # Checked before announcing anything, reported after — so the "online"
+        # message is never the last word when the wallet can't actually trade.
+        warning = await wallet_check(s)
         # Puts /top in Telegram's own command menu, so it's discoverable
         # without reading any documentation.
         try:
@@ -853,6 +887,9 @@ async def main():
                          f"{C.SIZE_SOL} SOL per trade · TP {C.TPS[0]}x/{C.TPS[1]}x\n\n"
                          f"Send /top when you're ready to trade.",
                       [[{"text": "📋 Show the board", "callback_data": "board"}]])
+
+        if warning:
+            await tg_send(s, warning)
 
         # ── did we come back holding something? ─────────────────────────────
         # If the bot died mid-trade, those positions are still in your wallet
