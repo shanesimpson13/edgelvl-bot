@@ -390,13 +390,21 @@ async def unarm(s, mint, source="you"):
 
 
 async def arm_mint(s, mint):
+    """Start working a coin. Both the Telegram tap and the web greenlight land here.
+
+    Every outcome is logged. Failures used to go only to Telegram, which meant a
+    greenlight that quietly didn't arm left no trace to diagnose afterwards.
+    """
     """Start working a coin. Both the Telegram tap and the web terminal land here.
 
     Returns True if a session started. The card might be from an earlier run of
     the bot (you restarted, or you're scrolling back), so if we don't recognise
     the mint, go and fetch it rather than silently ignoring you.
     """
+    print(f"ARM-REQ {mint[:12]}…", flush=True)
+
     if mint in live_sessions:
+        print(f"ARM-SKIP {mint[:12]}… already working it", flush=True)
         await tg_send(s, "Already working that one.")
         return False
 
@@ -404,6 +412,7 @@ async def arm_mint(s, mint):
     if sig is None:
         sig = await lookup_coin(s, mint)
     if sig is None:
+        print(f"ARM-FAIL {mint[:12]}… lookup returned nothing", flush=True)
         await tg_send(s, "Couldn't load that coin — it may have aged out "
                          "of the feed. Tap a more recent signal.")
         return False
@@ -550,6 +559,7 @@ async def work_coin(s, sig):
 
     blocked = sess.blocked_reason()
     if blocked:
+        print(f"ARM-BLOCKED {name}: {blocked}", flush=True)
         await tg_send(s, f"🛑 <b>{name}</b> skipped — {blocked}")
         live_sessions.pop(mint, None)
         # This returns before the cleanup below, so drop it here too — otherwise
