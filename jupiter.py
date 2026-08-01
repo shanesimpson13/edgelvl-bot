@@ -76,10 +76,18 @@ async def rpc(s, method, params):
         return await r.json()
 
 
-async def quote(s, in_mint, out_mint, amount, slippage_bps=None):
+async def quote(s, in_mint, out_mint, amount, slippage_bps=None, with_fee=False):
+    """A route for this swap.
+
+    with_fee applies the platform fee. Deliberately OFF for the price-probe
+    quotes the strategy watches with — a fee would skew every price reading —
+    and ON only for quotes that become real swaps.
+    """
     url = (f"{JUP}/quote?inputMint={in_mint}&outputMint={out_mint}"
            f"&amount={int(amount)}&slippageBps={slippage_bps or C.SLIPPAGE_BPS}"
            f"&restrictIntermediateTokens=true")
+    if with_fee and C.FEE_ACCOUNT and C.FEE_BPS > 0:
+        url += f"&platformFeeBps={C.FEE_BPS}"
     q, err = await _paced_get(s, url, _headers())
     return q
 
@@ -133,6 +141,9 @@ async def _send(s, q):
             "priorityLevelWithMaxLamports": {
                 "maxLamports": C.PRIORITY_LAMPS, "priorityLevel": "high"}},
     }
+    # The quote carries platformFee; the swap build needs the account to pay it to.
+    if C.FEE_ACCOUNT and q.get("platformFee"):
+        body["feeAccount"] = C.FEE_ACCOUNT
     async with s.post(f"{JUP}/swap", json=body) as r:
         sj = await r.json()
     if not sj.get("swapTransaction"):
@@ -179,7 +190,7 @@ async def sell(s, mint, raw_amount):
     """Sell `raw_amount` raw tokens back to SOL. Returns (sig, error)."""
     if raw_amount <= 0:
         return None, "nothing_to_sell"
-    q = await quote(s, mint, WSOL, int(raw_amount))
+    q = await quote(s, mint, WSOL, int(raw_amount), with_fee=True)
     if not q.get("outAmount"):
         return None, "no_route"
     sig, err = await _send(s, q)

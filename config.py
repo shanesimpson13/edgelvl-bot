@@ -39,6 +39,17 @@ JUP_HOST       = os.environ.get("JUP_HOST", "https://api.jup.ag/swap/v1")
 JUP_MAX_RPS    = float(os.environ.get("JUP_MAX_RPS", "1.0" if os.environ.get("JUP_API_KEY") else "0.5"))
 JUP_COOLDOWN   = 20.0    # seconds to back off after a 429 before trying again
 
+# ── platform fee ────────────────────────────────────────────────────────────
+# Taken by Jupiter on each swap and paid to FEE_ACCOUNT. Off until an account is
+# set, so it can never quietly charge anyone.
+#
+# FEE_ACCOUNT must be a token account you own for the mint the fee is collected
+# in. Jupiter takes the fee from the OUTPUT token, so for SOL -> token buys the
+# fee arrives in that token; simplest is to collect on the SELL legs, where the
+# output is SOL/WSOL and every fee lands in one account.
+FEE_ACCOUNT    = os.environ.get("FEE_ACCOUNT", "")
+FEE_BPS        = int(os.environ.get("FEE_BPS", "100"))      # 100 = 1%
+
 # ── where state lives ───────────────────────────────────────────────────────
 # Open positions are written here after every change so a crash or restart
 # can't lose track of a bag you're holding. Don't delete this while trading.

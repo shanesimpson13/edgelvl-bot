@@ -330,7 +330,8 @@ def _band(sess, MC):
     }
 
 
-async def report_status(s, mint, name, state, mc, pnl_frac, mult=None, open_pct=None, band=None):
+async def report_status(s, mint, name, state, mc, pnl_frac, mult=None,
+                        open_pct=None, band=None, targets=None):
     """Tell the terminal what the bot just did.
 
     One-way and best-effort: the bot owns positions and P&L, the terminal only
@@ -340,7 +341,8 @@ async def report_status(s, mint, name, state, mc, pnl_frac, mult=None, open_pct=
         await s.post(f"{C.EDGE_API}/api/status",
                      json={"mint": mint, "name": name, "state": state,
                            "mc": mc, "pnl": pnl_frac, "dry_run": C.DRY_RUN,
-                           "mult": mult, "open_pct": open_pct, "band": band},
+                           "mult": mult, "open_pct": open_pct, "band": band,
+                           "targets": targets},
                      headers={"Authorization": f"Bearer {C.EDGE_API_KEY}"},
                      timeout=aiohttp.ClientTimeout(total=10))
     except Exception:
@@ -692,7 +694,11 @@ async def work_coin(s, sig):
                                      f"Entry at <b>{MC(fill_px)}</b> MC\n"
                                      f"TP {MC(fill_px*sess.tps[0])} / {MC(fill_px*sess.tps[1])} · "
                                      f"stop -{int(sess.kill*100)}% off peak")
-                    await report_status(s, mint, name, "bought", MC(fill_px), None)
+                    await report_status(
+                        s, mint, name, "bought", MC(fill_px), None,
+                        targets={"entry": MC(fill_px),
+                                 "tps": [MC(fill_px * t) for t in sess.tps],
+                                 "stop": MC(fill_px * (1 - sess.kill))})
 
                 elif act[0] == "SELL":
                     frac, label = act[1], act[2]
@@ -720,9 +726,16 @@ async def work_coin(s, sig):
                             s, f"💰 <b>{name}</b> TP{rung}{tag} · sold {sold_pct}% at "
                                f"<b>{MC(price)}</b> MC ({mult}x) for {got:.4f} SOL"
                                + (f"\n{open_pct}% still riding to {sess.tps[rung]}x." if not is_last else ""))
-                        await report_status(s, mint, name, f"tp{rung}", MC(price),
-                                            (received - spent) / max(spent, 1e-9),
-                                            mult=mult, open_pct=open_pct)
+                        await report_status(
+                            s, mint, name, f"tp{rung}", MC(price),
+                            (received - spent) / max(spent, 1e-9),
+                            mult=mult, open_pct=open_pct,
+                            # entry and the remaining rung, so a part-sold
+                            # position still says where the rest gets out
+                            targets={"entry": MC(entry_px),
+                                     "tps": [MC(entry_px * t) for t in sess.tps],
+                                     "next": MC(entry_px * sess.tps[rung]) if rung < len(sess.tps) else None,
+                                     "stop": MC(sess.ppeak * (1 - sess.kill)) if sess.ppeak else None})
                     if tokens_held <= 0 or is_last:
                         sess.on_closed()
                         break
@@ -764,8 +777,20 @@ async def work_coin(s, sig):
         # restart, which is how you end up watching yesterday's trade.
         armed_mints.discard(mint)
         S.save(open_positions, seen_signals, armed_mints)
-        record(sess, entry_px, spent, received)
+        row = record(sess, entry_px, spent, received)
+        await push_trade(s, row)
         await report(s, sess, entry_px, spent, received)
+
+
+async def push_trade(s, row):
+    """Send a finished session to your journal. Best-effort — the local
+    trades.jsonl is the record of truth, this is for reading it back."""
+    try:
+        await s.post(f"{C.EDGE_API}/api/trades", json=row,
+                     headers={"Authorization": f"Bearer {C.EDGE_API_KEY}"},
+                     timeout=aiohttp.ClientTimeout(total=10))
+    except Exception:
+        pass
 
 
 def record(sess, entry_px, spent, received):
@@ -789,6 +814,7 @@ def record(sess, entry_px, spent, received):
     }
     with open(LOG, "a") as f:
         f.write(json.dumps(row) + "\n")
+    return row
 
 
 async def report(s, sess, entry_px, spent, received):
