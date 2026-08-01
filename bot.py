@@ -657,6 +657,12 @@ async def work_coin(s, sig):
             if (sess.state == "WAIT" and price and mc_factor
                     and time.time() - last_band > 15):
                 last_band = time.time()
+                # Buy/sell balance is checked AT THE BUY, so it has to be the
+                # current reading — the one from when you greenlit is stale by
+                # the time a setup appears.
+                fresh = await lookup_coin(s, mint)
+                if fresh and isinstance(fresh.get("volr"), (int, float)):
+                    sess.volr = fresh["volr"]
                 await report_status(
                     s, mint, name, "watching", MC(price), None,
                     band=_band(sess, MC))

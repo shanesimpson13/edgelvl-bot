@@ -45,10 +45,12 @@ s, ev = drive(RUNWAY + DIP + BOUNCE + [95, 100, 110] + [70, 55, 50, 45, 40, 35, 
 assert any(e[0][0] == "SELLALL" for e in ev), "should stop out on -50% from peak"
 print("PASS 2 · trailing stop fires")
 
-# 3 — volR gate
-assert Session("m", "BAD", volr=0.5).blocked_reason() is not None
+# 3 — B/S never refuses a session (it gates the buy instead; see test 12)
+assert Session("m", "BAD", volr=0.5).blocked_reason() is None
 assert Session("m", "GOOD", volr=1.4).blocked_reason() is None
-print("PASS 3 · volR gate blocks <1.0, passes >1.0")
+assert not Session("m", "BAD", volr=0.5).bs_ok(), "weak flow should block the BUY"
+assert Session("m", "GOOD", volr=1.4).bs_ok()
+print("PASS 3 · weak B/S blocks the buy, never the session")
 
 # 4 — pico-top guard: recovery to within 10% of the high must NOT buy
 s, ev = drive(RUNWAY + DIP + [99.0])
@@ -112,12 +114,14 @@ def test_custom_settings():
 
     assert s.dip == 0.30 and s.bounce == 1.10 and s.kill == 0.25
     assert s.tps == (3.0, 5.0) and s.fracs == (0.5, 0.5), s.fracs
-    # volr 1.5 passes the shipped 1.0 floor but not this user's 2.0
-    assert s.blocked_reason() is not None, "custom volr floor must apply"
+    # volr 1.5 passes the shipped 1.0 floor but not this user's 2.0 — and that
+    # now defers the buy rather than refusing the session
+    assert s.blocked_reason() is None
+    assert not s.bs_ok(), "custom B/S floor must apply at the buy"
 
     # and the shipped defaults still apply when nothing is set
     d = Session("m", "default", volr=1.5)
-    assert d.dip == C.DIP and d.tps == C.TPS and d.blocked_reason() is None
+    assert d.dip == C.DIP and d.tps == C.TPS and d.bs_ok()
 
     # a 30% dip must not trigger on a 20% dip
     s2 = Session("m", "deep", cfg={"dip": 0.30, "bounce": 1.10})
@@ -163,4 +167,35 @@ def test_ladder_sells_whole_position():
 
 
 test_ladder_sells_whole_position()
+
+
+def test_bs_checked_at_buy():
+    """Buy/sell balance gates the BUY, not the session.
+
+    It's a trailing 5-minute ratio that flips constantly. Refusing to watch a
+    coin because of one weak reading at greenlight time is how CallDog got
+    skipped and then ran 2x. The reading that matters is the one at the moment
+    we'd actually buy.
+    """
+    weak = Session("m", "weak", volr=0.88)
+    assert weak.blocked_reason() is None, "a weak reading must not refuse the session"
+    weak.warmup = 1
+    got = [weak.feed(p) for p in [100.0] * 5 + [80.0, 88.0]]
+    assert ("BUY",) not in got, "must not buy while more is being sold than bought"
+
+    # same setup, flow recovers (as the 15s refresh would update it)
+    ok = Session("m", "recovers", volr=0.88)
+    ok.warmup = 1
+    for p in [100.0] * 5 + [80.0]:
+        ok.feed(p)
+    ok.volr = 1.20
+    assert ok.feed(88.0) == ("BUY",), "should buy once buy-side flow returns"
+
+    # and an unknown reading never blocks
+    unknown = Session("m", "unknown")
+    assert unknown.bs_ok(), "no data must not mean no trade"
+    print("PASS 12 · B/S gates the buy, not the session")
+
+
+test_bs_checked_at_buy()
 print("\nALL STRATEGY TESTS PASSED")

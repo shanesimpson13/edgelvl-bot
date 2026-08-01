@@ -107,10 +107,21 @@ class Session:
         return recent >= older * (1 - C.SLOPE_TOL)
 
     def blocked_reason(self):
-        """Why we'd refuse to trade this coin at all. None = it's tradeable."""
-        if C.USE_VOLR and self.volr is not None and self.volr < self.volr_min:
-            return f"volR {self.volr:.2f} < {self.volr_min} — early sell pressure (0/13 historically)"
+        """Why we'd refuse to watch this coin at all. None = worth watching.
+
+        Buy/sell balance is deliberately NOT checked here. It's a trailing
+        5-minute ratio that flips constantly, so one bad reading at the moment
+        you greenlight says almost nothing about the moment we'd actually buy —
+        and rejecting the whole session on it means never looking again. It's
+        checked at the buy instead, against the current reading.
+        """
         return None
+
+    def bs_ok(self):
+        """Is buy/sell flow healthy right now? Checked at the moment of entry."""
+        if not C.USE_VOLR or self.volr is None:
+            return True
+        return self.volr >= self.volr_min
 
     # ── the loop ────────────────────────────────────────────────────────────
     def feed(self, price):
@@ -168,6 +179,11 @@ class Session:
             return None
         if price >= self.peak * self.pico:
             self.low = None                                # too close to the top — wait for a lower entry
+            return None
+        if not self.bs_ok():
+            # More is being sold than bought right this minute. Don't buy into
+            # that — but keep the dip on record and keep watching, because this
+            # flips back and the setup may still be here.
             return None
 
         return ("BUY",)
