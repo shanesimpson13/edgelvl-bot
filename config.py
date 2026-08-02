@@ -9,8 +9,6 @@ import os
 # ── your credentials ────────────────────────────────────────────────────────
 EDGE_API_KEY   = os.environ["EDGE_API_KEY"]          # from edgelvl.app/welcome
 EDGE_API       = "https://api.scgalpha.com"
-TG_TOKEN       = os.environ["TELEGRAM_BOT_TOKEN"]    # your bot, from @BotFather
-TG_CHAT        = os.environ["TELEGRAM_CHAT_ID"]      # your user id, from @userinfobot
 
 # Only needed when you go LIVE (Module 08). Dry run reads prices from Jupiter
 # and never touches an RPC or your wallet, so leave these empty until then.
@@ -87,12 +85,6 @@ DRY_RUN        = os.environ.get("DRY_RUN", "1") == "1"   # 1 = simulate, 0 = REA
 SIZE_SOL       = float(os.environ.get("SIZE_SOL", "0.05"))  # per trade
 
 # ── the feed ────────────────────────────────────────────────────────────────
-# Push every single signal to Telegram as it fires? The vault alerts dozens a
-# day, and a scroll of cards is the thing that makes people stop reading them.
-# Off by default: send /top when you're ready to trade and see only the handful
-# still moving. Set to 1 if you'd rather have the firehose.
-PUSH_EVERY_SIGNAL = os.environ.get("PUSH_EVERY_SIGNAL", "0") == "1"
-
 GREENLIGHT_POLL_SEC = 5  # how often to check the terminal for coins you greenlit
                          # at edgelvl.app. The terminal only queues the mint — your
                          # keys and your wallet never leave your machine.
