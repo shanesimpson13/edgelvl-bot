@@ -4,3 +4,9 @@ trades.jsonl
 __pycache__/
 *.pyc
 venv/
+
+# .env.before-live matched none of the patterns above it
+.env*
+!.env.example
+*.pre-*
+*.bak-*
