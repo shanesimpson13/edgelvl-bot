@@ -20,32 +20,47 @@ log = logging.getLogger("state")
 STATE_FILE = Path(C.STATE_FILE)
 
 
-def save(positions, seen):
+def save(positions, seen, armed=()):
     """Write everything to disk. Called after every state change."""
     try:
         STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         tmp = STATE_FILE.with_suffix(".tmp")
         with open(tmp, "w") as f:
-            json.dump({"positions": positions, "seen": sorted(seen)}, f, default=str)
+            # armed is a map now: key -> {"user", "wallet_id"}. A bare list
+            # from an older build still loads, it just has nothing to re-arm
+            # with. Written as a map so a restart can put the coin back on the
+            # wallet it belonged to.
+            armed_out = (armed if isinstance(armed, dict)
+                         else {k: {} for k in armed})
+            json.dump({"positions": positions, "seen": sorted(seen),
+                       "armed": armed_out}, f, default=str)
         tmp.replace(STATE_FILE)          # atomic — a crash mid-write can't corrupt it
     except Exception as e:
         log.error(f"save failed: {e}")
 
 
 def load():
-    """Returns (positions, seen). Empty on first run."""
+    """Returns (positions, seen, armed). Empty on first run.
+
+    `armed` is coins you greenlit that hadn't bought yet. Those sessions live in
+    memory, so without this a restart drops them silently — you'd think the bot
+    was watching a coin that nothing is watching.
+    """
     if not STATE_FILE.exists():
-        return {}, set()
+        return {}, set(), {}
     try:
         d = json.load(open(STATE_FILE))
         pos = d.get("positions", {}) or {}
         seen = set(d.get("seen", []) or [])
+        armed = d.get("armed") or {}
+        if isinstance(armed, list):       # written by an older build
+            armed = {k: {} for k in armed}
         if pos:
             log.info(f"restored {len(pos)} open position(s) from disk")
-        return pos, seen
+        return pos, seen, armed
     except Exception as e:
         log.error(f"load failed: {e}")
-        return {}, set()
+        return {}, set(), {}
 
 
 async def reconcile(session, positions, get_balance):
@@ -56,10 +71,12 @@ async def reconcile(session, positions, get_balance):
       - wallet has less  -> a sell landed that we didn't record; resync the amount
       - wallet has none  -> position is gone (sold, rugged, or dust); drop it
 
-    Returns a list of human-readable notes about anything that changed, so the
-    bot can tell you rather than silently fixing it behind your back.
+    Returns (notes, closed): human-readable notes about anything that changed,
+    and the positions that vanished entirely. The caller needs the second one to
+    journal an exit it did not make — dropping the position without recording
+    it leaves the trade out of the history altogether.
     """
-    notes = []
+    notes, closed = [], []
     for mint in list(positions.keys()):
         pos = positions[mint]
         saved = int(pos.get("tokens_raw", 0) or 0)
@@ -74,8 +91,9 @@ async def reconcile(session, positions, get_balance):
 
         if actual == 0:
             notes.append(f"{pos.get('name', mint[:8])}: no longer in wallet — closing it out")
+            closed.append((mint, pos))
             positions.pop(mint, None)
         elif actual != saved:
             notes.append(f"{pos.get('name', mint[:8])}: wallet has {actual:,} not {saved:,} — resynced")
             pos["tokens_raw"] = actual
-    return notes
+    return notes, closed

@@ -7,16 +7,102 @@ own results and tuning them. Read the notes: each number has a reason.
 import os
 
 # ── your credentials ────────────────────────────────────────────────────────
-EDGE_API_KEY   = os.environ["EDGE_API_KEY"]          # from edgelvl.app/welcome
-EDGE_API       = "https://api.scgalpha.com"
-TG_TOKEN       = os.environ["TELEGRAM_BOT_TOKEN"]    # your bot, from @BotFather
-TG_CHAT        = os.environ["TELEGRAM_CHAT_ID"]      # your user id, from @userinfobot
+# The bot's credential. NOT a licence key and NOT a user token: the terminal's
+# auth is Privy sign-in and the bot has no browser session, so it presents this
+# local secret instead. Required, not optional — a missing credential should
+# stop the bot loudly at startup rather than 401 on every call for hours.
+BOT_ADMIN_KEY  = os.environ["BOT_ADMIN_KEY"]
+# Loopback when the bot shares a box with the API — see the note in bot.py.
+# The public URL stays the default so a remote bot still works unchanged.
+EDGE_API       = os.environ.get("EDGE_API", "https://api.edgelvl.app")
 
 # Only needed when you go LIVE (Module 08). Dry run reads prices from Jupiter
 # and never touches an RPC or your wallet, so leave these empty until then.
 RPC_URL        = os.environ.get("RPC_URL", "https://api.mainnet-beta.solana.com")
 PRIVATE_KEY    = os.environ.get("PRIVATE_KEY", "")   # dedicated trading wallet, base58
-JUP_API_KEY    = os.environ.get("JUP_API_KEY", "")   # free from portal.jup.ag (live only)
+
+# ── Privy: trading without holding a key ────────────────────────────────────
+# Set these and the bot stops using PRIVATE_KEY entirely. It builds swaps and
+# asks Privy to sign them; Privy checks the wallet's policy first. The policy
+# allows Jupiter and leaves the System Program off the allow-list, so a SOL
+# transfer isn't blocked — it's unrepresentable. Verified in test_privy.py.
+#
+# The trade-off, so it isn't a surprise later: no System Program means the bot
+# can't wrap SOL, so the trading balance lives as WSOL and cycles
+# WSOL -> token -> WSOL. Deposits get wrapped once; withdrawals are signed by
+# the wallet's owner in the terminal, never by us.
+PRIVY_APP_ID         = os.environ.get("PRIVY_APP_ID", "")
+PRIVY_APP_SECRET     = os.environ.get("PRIVY_APP_SECRET", "")
+PRIVY_WALLET_ID      = os.environ.get("PRIVY_WALLET_ID", "")
+
+# Off by default. When on, the bot asks the API for greenlights across ALL
+# users and trades each one's own wallet. Deliberately explicit: nothing about
+# a stray env var should cause this process to start signing for accounts it
+# was not pointed at.
+MULTI_USER           = os.environ.get("MULTI_USER", "").lower() in ("1", "true", "yes")
+# Multi-user is off until explicitly switched on. BOT_ADMIN_KEY above is what
+# authorises acting for another account.
+PRIVY_WALLET_ADDRESS = os.environ.get("PRIVY_WALLET_ADDRESS", "")
+
+# OUR signing key — a P-256 keypair, base64 PKCS8 with no PEM headers. This is
+# what makes us a signer on a customer's wallet. It is NOT a wallet key and
+# cannot move funds on its own; what it can do is bounded by the policy the
+# customer owns. Generate one with: node -e "require('@privy-io/node')
+#   .generateP256KeyPair().then(k => console.log(JSON.stringify(k)))"
+PRIVY_AUTH_PRIVATE_KEY = os.environ.get("PRIVY_AUTH_PRIVATE_KEY", "")
+PRIVY_AUTH_PUBLIC_KEY  = os.environ.get("PRIVY_AUTH_PUBLIC_KEY", "")
+
+# The programs a swap may touch are defined in privy.py, next to the policy rule
+# that enforces them — see privy.SWAP_PROGRAMS. Keeping the list in one place
+# means the check we run before signing can't drift from the rule Privy applies.
+
+# ── Jupiter ─────────────────────────────────────────────────────────────────
+# A key is free from portal.jup.ag and you want one: prices come from Jupiter
+# quotes, and without a key you are sharing a very small public allowance.
+JUP_API_KEY    = os.environ.get("JUP_API_KEY", "")
+
+# Jupiter collects the platform fee into this referral account and picks which
+# mint to take it in, preferring SOL. That choice is what makes the fee work on
+# Token-2022 coins, where our own wSOL fee account failed the whole swap.
+# Empty means no fee is charged at all — which is also how an exempt wallet is
+# expressed, since Jupiter's floor for a referral fee is 50bps.
+REFERRAL_ACCOUNT = os.environ.get("REFERRAL_ACCOUNT", "")
+JUP_HOST       = os.environ.get("JUP_HOST", "https://api.jup.ag/swap/v1")
+
+# Requests per second across ALL watched coins combined — not per coin.
+# Each coin polls once a second, so watching 3 coins needs 3 rps. Above your
+# allowance Jupiter answers 429, which arrives as an empty quote and reads to the
+# strategy as "no price": it then waits forever without ever erroring. Keep this
+# at or under what your key actually allows.
+# MEASURED, not assumed:
+#   no key  — 1 req/s is ~50% rate-limited, 1 req/2s is clean  -> 0.5 rps
+#   free key — 1 req/s is clean, 2 req/s is ~50% limited       -> 1.0 rps
+#
+# This budget is shared across every coin being watched, so ONE coin gets the
+# full 1s resolution the strategy expects and each extra coin divides it: three
+# armed coins means each is priced every ~3s. Watch fewer at once, or raise this
+# if you move to a paid Jupiter plan.
+JUP_MAX_RPS    = float(os.environ.get("JUP_MAX_RPS", "1.0" if os.environ.get("JUP_API_KEY") else "0.5"))
+JUP_COOLDOWN   = 20.0    # seconds to back off after a 429 before trying again
+
+# ── platform fee ────────────────────────────────────────────────────────────
+# Taken by Jupiter on each swap and paid to FEE_ACCOUNT. Off until an account is
+# set, so it can never quietly charge anyone.
+#
+# FEE_ACCOUNT must be a WSOL token account you own. Both legs pay into it.
+#
+# For ExactIn swaps Jupiter takes the fee from the INPUT mint, so a SOL -> coin
+# buy pays its fee in wSOL, and a coin -> SOL sell pays in wSOL because that is
+# the output. One account collects everything, no per-coin accounts. Confirmed
+# by simulating a buy against the token program, not from the docs — the swap
+# BUILD accepts a mismatched fee account happily and only fails on execution.
+FEE_ACCOUNT    = os.environ.get("FEE_ACCOUNT", "")
+FEE_BPS        = int(os.environ.get("FEE_BPS", "100"))      # 100 = 1%
+
+# Gas sponsor. When set, we build the swap ourselves and this key pays the
+# network fee, so a customer never needs native SOL and every lamport they
+# deposit can stay wrapped and tradeable.
+SPONSOR_SECRET = os.environ.get("SPONSOR_SECRET", "")
 
 # ── where state lives ───────────────────────────────────────────────────────
 # Open positions are written here after every change so a crash or restart
@@ -28,6 +114,19 @@ DRY_RUN        = os.environ.get("DRY_RUN", "1") == "1"   # 1 = simulate, 0 = REA
 SIZE_SOL       = float(os.environ.get("SIZE_SOL", "0.05"))  # per trade
 
 # ── the feed ────────────────────────────────────────────────────────────────
+GREENLIGHT_POLL_SEC = float(os.environ.get("GREENLIGHT_POLL_SEC", 5))
+# How often the bot tells the terminal what it is seeing. The price loop is
+# 1s, so anything slower means readings nobody ever sees.
+STATUS_PUBLISH_SEC = float(os.environ.get("STATUS_PUBLISH_SEC", 1))
+
+# Touch this file and the bot stops taking new coins. Open positions keep
+# being managed. Delete it to resume. Deliberately a file: it has to work
+# without a restart, since avoiding a badly-timed restart is the point.
+PAUSE_FILE = os.environ.get("PAUSE_FILE", "state/paused")
+# How often to check the terminal for coins you greenlit. 5s was sized for a
+# public HTTPS round trip; over loopback the call is ~1.2ms and this can be 1.
+                         # at edgelvl.app. The terminal only queues the mint — your
+                         # keys and your wallet never leave your machine.
 FEED_POLL_SEC  = 10      # how often to check for new signals (10s = you see an alert
                          # within ~5s of it firing; polling faster gains nothing)
 POLL_SEC       = 1.0     # price poll interval. 1s is the sweet spot: fast enough to
@@ -41,15 +140,35 @@ BOUNCE         = 1.04    # then +4% up off that dip low = the reclaim trigger
 DEADCAT        = 0.50    # skip if price is >50% below the running peak (falling knife)
 PICO           = 0.90    # skip if the bounce is already within 10% of the high
                          #   (that's a pico-top entry — wait for a lower one)
-SLOPE_WIN      = 300     # slope window in POLLS. At 1s polling = a 5-minute window.
-SLOPE_TOL      = 0.02    # allow 2% droop before calling the trend "rolling over"
-WARMUP         = 250     # polls to observe before ANY entry (~4 min). Stops you buying
-                         #   into a coin you've only seen 3 seconds of.
 
-# ── volR gate (needs the signal feed) ───────────────────────────────────────
+# How long a coin is watched before a buy is allowed, in seconds.
+#
+# This was 250 SWAPS, converted to polls through the coin's trade rate — a
+# number carried over from a backtest that read every swap instead of polling
+# once a second. Nothing downstream ever needed 250 observations. It fed the
+# slope filter, and that filter was removed for blocking exactly the deep dips
+# the entry rule exists to catch; the only remaining mechanism with a real
+# floor is the outlier median, which needs 10 prices.
+#
+# So it is a plain setting now: how many seconds of tape before you act.
+WARMUP_SEC     = 10.0
+WARMUP_MIN_SEC = 5.0
+WARMUP_MAX_SEC = 60.0
+
+# Ring buffer behind the outlier median (which reads the last 15). Not a
+# strategy window — just headroom.
+PRICE_WIN      = 60
+
+# ── the board ───────────────────────────────────────────────────────────────
+# /top shows Solana's 5m-trending coins ranked by real trailing 5m volume.
+# Anything under this floor is noise — a chart that's barely moving isn't a
+# setup, it's a coin waiting to bleed.
+MIN_VOL_5M     = float(os.environ.get("MIN_VOL_5M", "5000"))
+
+# ── volR gate ───────────────────────────────────────────────────────────────
 # Early buy-volume vs sell-volume. Our data: coins alerting with volR < 1.0 went
 # 0-for-13. It's the single best "don't touch this" filter we have.
-# It can't be computed from price alone, so it arrives with the signal.
+# It comes from the trending feed (buy_volume_5m / sell_volume_5m).
 USE_VOLR       = True
 VOLR_MIN       = 1.0     # skip the coin entirely if volR is below this
 
@@ -66,6 +185,12 @@ FRACS          = (0.70, 0.30)
 # Why so loose? Tighter stops shook us out of coins that went on to run. A -25%
 # stop looks safer and bled more. See Module 08.
 KILL           = 0.50
+# Polls the decision price is a median of. 1 acts on the price as read, so a
+# take-profit or a stop fires on the tick that crosses it. Higher ignores a bad
+# single print at the cost of reacting later — and a spike shorter than half the
+# window never registers at all, which is how take-profits get missed on a coin
+# that genuinely traded through them.
+SMOOTHING      = float(os.environ.get("SMOOTHING", 1))
 
 # ── time limits ─────────────────────────────────────────────────────────────
 ENTRY_TIMEOUT  = 3600    # give up waiting for an entry after 60 min
