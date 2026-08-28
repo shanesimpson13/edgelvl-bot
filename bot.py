@@ -1007,11 +1007,17 @@ async def work_coin(s, sig, resume=None):
                 # about a second before the next heartbeat overwrote it — the
                 # rung fired, the board said nothing, and a part-sold position
                 # was indistinguishable from an untouched one.
-                held_state = f"tp{sess.tp_done}" if sess.tp_done else "bought"
+                # Rungs actually FILLED, not fired. tp_done increments the
+                # moment the rung triggers, which is seconds before the swap
+                # lands — so this published "TP1 hit 1.5x · 100% still riding",
+                # two claims about the same position that cannot both be true,
+                # with a Cancel button for tokens that were already leaving.
+                filled = len(rungs_hit)
+                held_state = f"tp{filled}" if filled else "bought"
                 held_open = (round(tokens_held / max(tokens_original, 1) * 100)
-                             if sess.tp_done and tokens_original else None)
-                held_mult = (sess.tps[sess.tp_done - 1]
-                             if sess.tp_done and sess.tp_done <= len(sess.tps) else None)
+                             if filled and tokens_original else None)
+                held_mult = (sess.tps[filled - 1]
+                             if filled and filled <= len(sess.tps) else None)
                 # Whatever will actually fire — trailing, fixed, or lifted to
                 # break-even. Never the formula for a mode that is not on.
                 stop_px = stop_px_of(sess)
@@ -1023,8 +1029,8 @@ async def work_coin(s, sig, resume=None):
                     # and is genuinely a live number.
                     targets={"entry": entry_mc,
                              "tps": tp_mcs,
-                             "next": (tp_mcs[sess.tp_done]
-                                      if sess.tp_done < len(tp_mcs) else None),
+                             "next": (tp_mcs[filled]
+                                      if filled < len(tp_mcs) else None),
                              "stop": MC(stop_px) if stop_px else None})
 
             if (sess.state == "WAIT" and price and mc_factor
