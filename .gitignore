@@ -10,3 +10,5 @@ venv/
 !.env.example
 *.pre-*
 *.bak-*
+run.log
+*.v1.bak

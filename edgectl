@@ -1,0 +1,119 @@
+#!/home/ubuntu/dsb-gmgn/venv/bin/python3
+"""Deploy without landing on top of a live trade.
+
+    ./edgectl status     what is open right now
+    ./edgectl pause      stop taking new coins (open ones keep running)
+    ./edgectl resume     take new coins again
+    ./edgectl deploy     pause, wait for the book to empty, restart, resume
+
+The restart itself is survivable — positions resume and armed coins come back.
+But the bot is blind for the seconds it takes to come up, and a stop cannot fire
+while nothing is watching. So the safe move is not a better restart, it is
+having nothing at risk when it happens.
+
+`deploy` refuses rather than guesses: if something is still open when the wait
+runs out, it resumes and leaves the deploy for you to decide about.
+"""
+import json
+import os
+import subprocess
+import sys
+import time
+
+HERE = "/home/ubuntu/edgelvl-live"
+PAUSE = os.path.join(HERE, "state", "paused")
+STATE = os.path.join(HERE, "state", "positions.json")
+WAIT_DEFAULT = 900          # 15 minutes; most trades are done well inside it
+
+
+def open_positions():
+    try:
+        with open(STATE) as f:
+            return json.load(f).get("positions") or {}
+    except Exception:
+        return {}
+
+
+def armed():
+    try:
+        with open(STATE) as f:
+            return json.load(f).get("armed") or {}
+    except Exception:
+        return {}
+
+
+def paused():
+    return os.path.exists(PAUSE)
+
+
+def show():
+    pos, arm = open_positions(), armed()
+    print(f"  paused    : {'YES — not taking new coins' if paused() else 'no'}")
+    print(f"  positions : {len(pos)}")
+    for k, p in pos.items():
+        print(f"      {p.get('name', k[:10]):12s} {int(p.get('tokens_raw') or 0):>18,} tokens"
+              f"  spent {p.get('spent_sol')} SOL")
+    print(f"  watching  : {len(arm)}")
+    for k in arm:
+        print(f"      {k.split('|')[-1][:14]}…")
+    return pos
+
+
+def do_pause():
+    os.makedirs(os.path.dirname(PAUSE), exist_ok=True)
+    open(PAUSE, "w").write(str(time.time()))
+    print("  paused — no new coins will be taken. Open positions keep running.")
+
+
+def do_resume():
+    if os.path.exists(PAUSE):
+        os.remove(PAUSE)
+    print("  resumed — taking new coins again.")
+
+
+def deploy(wait=WAIT_DEFAULT):
+    do_pause()
+    print(f"  waiting up to {wait // 60} min for open positions to finish…")
+    start = time.time()
+    while time.time() - start < wait:
+        pos = open_positions()
+        if not pos:
+            print("  book is empty — restarting")
+            subprocess.run(["sudo", "systemctl", "restart", "edgelvl-bot"], check=True)
+            time.sleep(12)
+            state = subprocess.run(["systemctl", "is-active", "edgelvl-bot"],
+                                   capture_output=True, text=True).stdout.strip()
+            print(f"  bot is {state}")
+            do_resume()
+            return 0
+        names = ", ".join(p.get("name", "?") for p in pos.values())
+        print(f"    still open: {names}   ({int(time.time() - start)}s)", flush=True)
+        time.sleep(15)
+
+    # Deliberately does NOT restart anyway. A position that has run past the
+    # wait is exactly the one you would not want to interrupt.
+    print("\n  STILL OPEN after the wait — not restarting.")
+    show()
+    print("\n  Resuming so trading is not left halted. Re-run when it is clear,")
+    print("  or restart by hand if you accept interrupting these.")
+    do_resume()
+    return 1
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
+    if cmd == "status":
+        show()
+    elif cmd == "pause":
+        do_pause()
+    elif cmd == "resume":
+        do_resume()
+    elif cmd == "deploy":
+        w = int(sys.argv[2]) if len(sys.argv) > 2 else WAIT_DEFAULT
+        sys.exit(deploy(w))
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    main()
