@@ -47,10 +47,13 @@ HELIUS = "https://api.helius.xyz/v0"
 # re-armed everything it had already traded would double up on open positions.
 _seen_path = os.path.join(os.path.dirname(C.STATE_FILE) or "state", "copy_seen.json")
 _seen = set()
-# mint -> when we first saw the bundle buy. Candidates waiting to migrate.
+# The follow list, refreshed from the terminal every cycle.
+_rules = []
+# mint -> {ts, rule, wallet}. Candidates waiting to migrate. Each remembers
+# WHICH row found it, because size, strategy and daily cap are per wallet.
 _candidates = {}
-# Armed today, for the daily cap. (day, count)
-_armed_today = [None, 0]
+# Armed today, per rule. (day, {rule_id: count})
+_armed_today = [None, {}]
 
 
 def _load_seen():
@@ -73,16 +76,61 @@ def _save_seen():
         pass
 
 
+async def _fetch_rules(s):
+    """The follow list, as set in the terminal.
+
+    The source of truth moved out of env vars: those are read once at import,
+    so changing who you follow meant an ssh session and a restart. Refetched
+    each cycle instead, which also means switching a wallet off in the UI stops
+    it within one poll rather than at the next deploy.
+
+    Returns None on failure, and the caller keeps the list it already had —
+    going blind because the API blinked is worse than acting on a stale list.
+    """
+    try:
+        hdrs = {"Authorization": f"Bearer {C.BOT_ADMIN_KEY}"}
+        async with s.get(f"{C.EDGE_API}/api/copy", headers=hdrs,
+                         timeout=aiohttp.ClientTimeout(total=15)) as r:
+            if r.status != 200:
+                return None
+            return await r.json()
+    except Exception:
+        return None
+
+
+async def _push_status(s):
+    """What the watcher is doing, for the terminal to show.
+
+    Best-effort and swallowed: a status that fails to send must never stop a
+    coin being armed.
+    """
+    try:
+        watching = [{"mint": m, "since": v["ts"], "wallet": v.get("wallet", "")}
+                    for m, v in _candidates.items()]
+        hdrs = {"Authorization": f"Bearer {C.BOT_ADMIN_KEY}"}
+        await s.post(f"{C.EDGE_API}/api/copy/status", headers=hdrs,
+                     json={"watching": watching, "armed_today": _armed_today[1]},
+                     timeout=aiohttp.ClientTimeout(total=10))
+    except Exception:
+        pass
+
+
 def _today():
     return time.strftime("%Y-%m-%d", time.gmtime())
 
 
-def _budget_left():
-    """Trades still allowed today. The cap is a circuit breaker, not a target."""
+def _budget_left(rule):
+    """Trades still allowed today FOR THIS WALLET.
+
+    Per rule rather than per box: following two wallets at different sizes
+    should not mean one can spend the other's budget. The cap is a circuit
+    breaker, not a target.
+    """
     if _armed_today[0] != _today():
         _armed_today[0] = _today()
-        _armed_today[1] = 0
-    return C.COPY_MAX_PER_DAY - _armed_today[1]
+        _armed_today[1] = {}
+    used = _armed_today[1].get(rule["id"], 0)
+    return int(rule.get("max_per_day", 8)) - used
 
 
 async def _get(s, url, tries=3):
@@ -156,28 +204,38 @@ async def run(s, arm, live_count):
     right now. Both are passed in so this module never imports the bot and can
     be tested on its own.
     """
-    if not C.COPY_ENABLED:
-        return
+    global _rules
     if not C.HELIUS_API_KEY:
         print("copywatch: no HELIUS_API_KEY — not watching", flush=True)
-        return
-    wallets = [w.strip() for w in C.COPY_WALLETS.split(",") if w.strip()]
-    if not wallets:
-        print("copywatch: no COPY_WALLETS — not watching", flush=True)
         return
 
     _load_seen()
     mode = "LIVE" if not C.DRY_RUN else "DRY"
-    print(f"copywatch {mode}: following {len(wallets)} wallet(s), "
-          f"{C.COPY_SIZE_SOL} SOL a coin, max {C.COPY_MAX_PER_DAY}/day, "
-          f"max {C.COPY_MAX_CONCURRENT} at once", flush=True)
+    # It starts regardless of whether anything is switched on. The follow list
+    # comes from the terminal now, so a watcher that refused to start on an
+    # empty list could never be turned on without a restart.
+    print(f"copywatch {mode}: reading the follow list from the terminal",
+          flush=True)
+    max_concurrent = C.COPY_MAX_CONCURRENT
 
     while True:
         try:
             now = time.time()
 
-            # 1 — new bundle buys become candidates.
-            for w in wallets:
+            d = await _fetch_rules(s)
+            if d is not None:
+                _rules = [r for r in (d.get("rules") or []) if r.get("enabled")
+                          and r.get("wallet")]
+                max_concurrent = int(d.get("max_concurrent") or C.COPY_MAX_CONCURRENT)
+            if not _rules:
+                await _push_status(s)
+                await asyncio.sleep(C.COPY_POLL_SEC)
+                continue
+
+            # 1 — new bundle buys become candidates, tagged with the row that
+            #     found them so the arm uses that row's size and strategy.
+            for rule in _rules:
+                w = rule["wallet"]
                 for mint, ts in await _bundle_buys(s, w):
                     if mint in _seen or mint in _candidates:
                         continue
@@ -188,12 +246,22 @@ async def run(s, arm, live_count):
                     if now - ts > C.COPY_MAX_SIGNAL_AGE:
                         _seen.add(mint)
                         continue
-                    _candidates[mint] = ts
+                    _candidates[mint] = {"ts": ts, "rule": rule["id"], "wallet": w}
                     print(f"copywatch: {mint[:12]}… bundled by {w[:8]}…, "
                           f"waiting for migration", flush=True)
 
             # 2 — candidates that migrated get armed; the rest time out.
-            for mint, ts in list(_candidates.items()):
+            for mint, cand in list(_candidates.items()):
+                ts = cand["ts"]
+                rule = next((r for r in _rules if r["id"] == cand["rule"]), None)
+                if rule is None:
+                    # The row was switched off or deleted while this waited.
+                    # Dropping it is the point: turning a wallet off should
+                    # stop it arming, not just stop it finding new coins.
+                    del _candidates[mint]
+                    print(f"copywatch: {mint[:12]}… dropped, its wallet is no "
+                          f"longer followed", flush=True)
+                    continue
                 if now - ts > C.COPY_MIGRATION_TIMEOUT:
                     del _candidates[mint]
                     _seen.add(mint)
@@ -223,31 +291,36 @@ async def run(s, arm, live_count):
 
                 # Rails. Each one is a reason to refuse, checked out loud so a
                 # quiet day is distinguishable from a broken watcher.
-                if _budget_left() <= 0:
-                    print(f"copywatch: {mint[:12]}… migrated but the daily cap "
-                          f"({C.COPY_MAX_PER_DAY}) is spent", flush=True)
+                if _budget_left(rule) <= 0:
+                    print(f"copywatch: {mint[:12]}… migrated but {rule['wallet'][:8]}…"
+                          f" has spent its daily cap ({rule.get('max_per_day')})",
+                          flush=True)
                     continue
                 open_now = live_count()
-                if open_now >= C.COPY_MAX_CONCURRENT:
+                if open_now >= max_concurrent:
                     print(f"copywatch: {mint[:12]}… migrated but {open_now} "
-                          f"already open (max {C.COPY_MAX_CONCURRENT})", flush=True)
+                          f"already open (max {max_concurrent})", flush=True)
                     continue
 
                 # Belt and braces on size. COPY_SIZE_SOL is the knob you tune;
                 # COPY_MAX_SIZE_SOL is the one that stops a typo becoming a
                 # position. A live bot should not be able to bet more than you
                 # decided when you were calm.
-                size = min(C.COPY_SIZE_SOL, C.COPY_MAX_SIZE_SOL)
-                print(f"copywatch: {mint[:12]}… MIGRATED → arming {size} SOL", flush=True)
+                size = min(float(rule.get("size_sol") or C.COPY_SIZE_SOL),
+                           C.COPY_MAX_SIZE_SOL)
+                preset = rule.get("preset") or None
+                print(f"copywatch: {mint[:12]}… MIGRATED → arming {size} SOL"
+                      f"{' on ' + preset if preset else ''}", flush=True)
                 try:
-                    ok = await arm(s, mint, opts={"size_sol": size,
-                                                  "preset": C.COPY_PRESET or None})
+                    ok = await arm(s, mint, opts={"size_sol": size, "preset": preset})
                 except Exception as e:
                     print(f"copywatch: arm error {mint[:8]}: {e}", flush=True)
                     ok = False
                 if ok:
-                    _armed_today[1] += 1
+                    _budget_left(rule)          # rolls the day over if needed
+                    _armed_today[1][rule["id"]] = _armed_today[1].get(rule["id"], 0) + 1
 
+            await _push_status(s)
             await asyncio.sleep(C.COPY_POLL_SEC)
         except Exception as e:
             # One bad cycle must never take the watcher down: a dead task looks
