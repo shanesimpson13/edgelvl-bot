@@ -169,8 +169,12 @@ async def _bundle_buys(s, wallet):
     """
     now = time.time()
     try:
+        # 100, not 25. Twenty-five spans ~43 min at this operator's current
+        # rate, but they run 16-48 launches a day -- in a burst that window
+        # shrinks below COPY_MAX_SIGNAL_AGE and bundles fall off the end
+        # SILENTLY. One call either way; the limit is free headroom.
         r = await J.rpc(s, "getSignaturesForAddress",
-                        [wallet, {"limit": 25}])
+                        [wallet, {"limit": 100}])
         sigs = (r or {}).get("result") or []
     except Exception as e:
         print(f"copywatch: signatures for {wallet[:8]}…: {e}", flush=True)
