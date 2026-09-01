@@ -242,6 +242,15 @@ COPY_MAX_CONCURRENT = int(os.environ.get("COPY_MAX_CONCURRENT", "2"))
 # only the API key -- no signing -- and it reports a buy, its launchpad and the
 # mint as fields rather than leaving us to infer them from balance deltas.
 WATCH_GMGN_KEY = os.environ.get("WATCH_GMGN_KEY", "")
+
+# GMGN bans by IP, and the board collectors share that IP on the free tier.
+# The board is the product; the watcher is a feature, so the watcher yields.
+# Two wallets read from the chain cost GMGN nothing and work today. Flip this
+# to 1 the moment the paid plan is live -- GMGN is the better source (one
+# request, labelled launchpad, no signature parsing), it just cannot be
+# afforded out of the board.s budget.
+COPY_USE_GMGN = os.environ.get("COPY_USE_GMGN", "0") == "1"
+
 COPY_MIN_BUNDLE_USD = float(os.environ.get("COPY_MIN_BUNDLE_USD", "40"))
 COPY_MIN_BUNDLE_SOL = float(os.environ.get("COPY_MIN_BUNDLE_SOL", "0.8"))
 # Migration lands a median 1.6 min after the bundle buy and p90 is under 5;

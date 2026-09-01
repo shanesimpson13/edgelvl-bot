@@ -171,7 +171,7 @@ async def _gmgn_buys(s, wallet):
     that has gone blind looks exactly like a quiet operator, which is the
     failure that takes longest to notice.
     """
-    if not C.WATCH_GMGN_KEY:
+    if not C.WATCH_GMGN_KEY or not C.COPY_USE_GMGN:
         return None
     # GMGN bans the IP, not the key, and the board collectors share that IP.
     # Knocking while banned appears to extend it, and GMGN tells us exactly
@@ -245,10 +245,12 @@ async def _bundle_buys(s, wallet):
     rate-limits or the key lapses, reading signatures ourselves keeps the
     watcher working instead of quietly finding nothing.
     """
-    got = await _gmgn_buys(s, wallet)
-    if got is not None:
-        return got
-    print(f"copywatch: falling back to chain reads for {wallet[:8]}…", flush=True)
+    if C.COPY_USE_GMGN:
+        got = await _gmgn_buys(s, wallet)
+        if got is not None:
+            return got
+        # Only worth saying when GMGN was meant to answer and did not.
+        print(f"copywatch: falling back to chain reads for {wallet[:8]}…", flush=True)
     return await _chain_buys(s, wallet)
 
 
