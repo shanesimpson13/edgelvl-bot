@@ -235,6 +235,14 @@ COPY_MAX_CONCURRENT = int(os.environ.get("COPY_MAX_CONCURRENT", "2"))
 # Below this, a bundle buy can't complete the curve, so the coin will never
 # migrate and never signal. Skipping them early just saves half an hour of
 # pointless polling.
+# The dollar floor, because GMGN's activity route reports cost in USD. This
+# operator's launch bundles land near $115 every time, so the floor separates
+# a bundle from dust rather than trying to be clever.
+# The same key the board collectors use. GMGN's wallet_activity route needs
+# only the API key -- no signing -- and it reports a buy, its launchpad and the
+# mint as fields rather than leaving us to infer them from balance deltas.
+WATCH_GMGN_KEY = os.environ.get("WATCH_GMGN_KEY", "")
+COPY_MIN_BUNDLE_USD = float(os.environ.get("COPY_MIN_BUNDLE_USD", "40"))
 COPY_MIN_BUNDLE_SOL = float(os.environ.get("COPY_MIN_BUNDLE_SOL", "0.8"))
 # Migration lands a median 1.6 min after the bundle buy and p90 is under 5;
 # everything measured arrived inside 30. After that it isn't coming.

@@ -35,6 +35,7 @@ import asyncio
 import json
 import os
 import time
+import uuid
 
 import aiohttp
 
@@ -45,6 +46,9 @@ WSOL = "So11111111111111111111111111111111111111112"
 # pump.fun's program, the same one the executor builds against. A launch bundle
 # is a swap through this, so its presence is what makes a transaction relevant.
 PUMP_FUN_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+GMGN_API = "https://openapi.gmgn.ai"
+# When GMGN says we are banned, when it lifts. Shared IP, shared cooldown.
+_gmgn_quiet_until = [0.0]
 # Signatures already examined. Without this the watcher would re-fetch every
 # transaction in the window on every poll, which is how you get rate-limited off
 # your own RPC.
@@ -152,20 +156,107 @@ async def _get(s, url, tries=3):
     return None
 
 
+async def _gmgn_buys(s, wallet):
+    """This wallet's recent buys, as GMGN already parsed them.
+
+    Better than reading the chain ourselves for one reason: every fact we need
+    is a FIELD rather than an inference. event_type says it is a buy,
+    launchpad_platform says it came from pump.fun, token.address is the mint.
+    Our own parser matched a program id and computed balance deltas, which
+    worked on the coin we tested and would have failed silently on a bundle
+    routed any other way.
+
+    Returns None — not [] — when GMGN cannot answer, so the caller can fall
+    back rather than treat an outage as "this wallet did nothing". A watcher
+    that has gone blind looks exactly like a quiet operator, which is the
+    failure that takes longest to notice.
+    """
+    if not C.WATCH_GMGN_KEY:
+        return None
+    # GMGN bans the IP, not the key, and the board collectors share that IP.
+    # Knocking while banned appears to extend it, and GMGN tells us exactly
+    # when it ends — so wait it out rather than add a third caller hammering
+    # through someone else's cooldown.
+    if time.time() < _gmgn_quiet_until[0]:
+        return None
+    try:
+        params = {"chain": "sol", "wallet_address": wallet, "type": "buy",
+                  "limit": "20", "timestamp": str(int(time.time())),
+                  "client_id": str(uuid.uuid4())}
+        async with s.get(f"{GMGN_API}/v1/user/wallet_activity", params=params,
+                         headers={"X-APIKEY": C.WATCH_GMGN_KEY,
+                                  "User-Agent": "Mozilla/5.0"},
+                         timeout=aiohttp.ClientTimeout(total=15)) as r:
+            if r.status in (429, 403):
+                try:
+                    reset = float((await r.json()).get("reset_at") or 0)
+                except Exception:
+                    reset = 0
+                # Ask when it lifts rather than guess with backoff.
+                _gmgn_quiet_until[0] = reset if reset > time.time() else time.time() + 120
+                print(f"copywatch: gmgn {r.status} — quiet for "
+                      f"{(_gmgn_quiet_until[0]-time.time())/60:.1f} min, "
+                      f"reading the chain meanwhile", flush=True)
+                return None
+            if r.status != 200:
+                print(f"copywatch: gmgn activity http {r.status} for "
+                      f"{wallet[:8]}…", flush=True)
+                return None
+            d = await r.json()
+    except Exception as e:
+        print(f"copywatch: gmgn activity {wallet[:8]}…: {e}", flush=True)
+        return None
+    if d.get("code") not in (0, None):
+        print(f"copywatch: gmgn activity {d.get('error')}", flush=True)
+        return None
+
+    inner = d.get("data") or d
+    if isinstance(inner.get("data"), dict):
+        inner = inner["data"]
+    out = []
+    for a in inner.get("activities") or []:
+        if (a.get("event_type") or a.get("type")) != "buy":
+            continue
+        # Stated by GMGN rather than matched by us. A launch bundle is a
+        # pump.fun buy; anything else this wallet does is not our signal.
+        plat = (a.get("launchpad_platform") or "").lower()
+        if "pump" not in plat:
+            continue
+        # The size floor, in dollars because that is what this route reports.
+        # Undersized buys cannot complete the curve, so their coins never
+        # migrate and never signal anyway.
+        try:
+            usd = float(a.get("cost_usd") or 0)
+        except (TypeError, ValueError):
+            usd = 0.0
+        if usd < C.COPY_MIN_BUNDLE_USD:
+            continue
+        mint = (a.get("token") or {}).get("address")
+        ts = a.get("timestamp")
+        if mint and ts:
+            out.append((mint, int(ts)))
+    return out
+
+
 async def _bundle_buys(s, wallet):
     """Mints this wallet has just bundle-bought on the pump.fun curve.
 
-    Read straight from the chain rather than from an enrichment vendor. Helius
-    parsed these for us, but the only things we need — did this touch pump.fun,
-    what did the wallet pay, which mint did it receive — are all in the plain
-    getTransaction response, and the RPC is one we already have.
+    GMGN first, the chain second. The fallback is not decoration: if GMGN
+    rate-limits or the key lapses, reading signatures ourselves keeps the
+    watcher working instead of quietly finding nothing.
+    """
+    got = await _gmgn_buys(s, wallet)
+    if got is not None:
+        return got
+    print(f"copywatch: falling back to chain reads for {wallet[:8]}…", flush=True)
+    return await _chain_buys(s, wallet)
 
-    Cost is kept down by only fetching signatures we have not already looked at:
-    a quiet wallet costs one getSignaturesForAddress per poll and nothing else.
 
-    A bundle buy is a pump.fun swap where the wallet SPENDS real size. The size
-    floor separates a launch bundle from dust: undersized buys cannot complete
-    the curve, so their coins never migrate and never signal anyway.
+async def _chain_buys(s, wallet):
+    """Fallback: the same question asked of the chain directly.
+
+    Reads recent signatures and looks for a pump.fun swap where the wallet
+    spent real size, computing what it paid from balance deltas.
     """
     now = time.time()
     try:
