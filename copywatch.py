@@ -39,9 +39,16 @@ import time
 import aiohttp
 
 import config as C
+import jupiter as J
 
 WSOL = "So11111111111111111111111111111111111111112"
-HELIUS = "https://api.helius.xyz/v0"
+# pump.fun's program, the same one the executor builds against. A launch bundle
+# is a swap through this, so its presence is what makes a transaction relevant.
+PUMP_FUN_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+# Signatures already examined. Without this the watcher would re-fetch every
+# transaction in the window on every poll, which is how you get rate-limited off
+# your own RPC.
+_sig_seen = set()
 
 # Mints we have already acted on, ever. Persisted, because a restart that
 # re-armed everything it had already traded would double up on open positions.
@@ -148,53 +155,129 @@ async def _get(s, url, tries=3):
 async def _bundle_buys(s, wallet):
     """Mints this wallet has just bundle-bought on the pump.fun curve.
 
+    Read straight from the chain rather than from an enrichment vendor. Helius
+    parsed these for us, but the only things we need — did this touch pump.fun,
+    what did the wallet pay, which mint did it receive — are all in the plain
+    getTransaction response, and the RPC is one we already have.
+
+    Cost is kept down by only fetching signatures we have not already looked at:
+    a quiet wallet costs one getSignaturesForAddress per poll and nothing else.
+
     A bundle buy is a pump.fun swap where the wallet SPENDS real size. The size
-    floor is what separates a launch bundle from the dust: undersized buys can't
-    complete the curve, so their coins never migrate and never signal anyway —
-    the floor just saves us tracking them for half an hour first.
+    floor separates a launch bundle from dust: undersized buys cannot complete
+    the curve, so their coins never migrate and never signal anyway.
     """
-    d = await _get(s, f"{HELIUS}/addresses/{wallet}/transactions"
-                      f"?api-key={C.HELIUS_API_KEY}&limit=25")
+    now = time.time()
+    try:
+        r = await J.rpc(s, "getSignaturesForAddress",
+                        [wallet, {"limit": 25}])
+        sigs = (r or {}).get("result") or []
+    except Exception as e:
+        print(f"copywatch: signatures for {wallet[:8]}…: {e}", flush=True)
+        return []
+
     out = []
-    for t in d or []:
-        if t.get("transactionError") or t.get("type") != "SWAP":
+    for row in sigs:
+        sig = row.get("signature")
+        if not sig or sig in _sig_seen:
             continue
-        if t.get("source") != "PUMP_FUN":
+        bt = row.get("blockTime") or 0
+        # Older than the window we would ever act on: mark it seen and never
+        # fetch it. This is what keeps a busy wallet cheap.
+        if bt and now - bt > C.COPY_MAX_SIGNAL_AGE:
+            _sig_seen.add(sig)
             continue
-        # What the wallet actually paid, native plus any wrapped SOL leg.
-        spent = 0.0
-        for ad in t.get("accountData", []):
-            if ad.get("account") == wallet:
-                spent += ad.get("nativeBalanceChange", 0) / 1e9
-            for tb in (ad.get("tokenBalanceChanges") or []):
-                if tb.get("userAccount") == wallet and tb.get("mint") == WSOL:
-                    ra = tb["rawTokenAmount"]
-                    spent += int(ra["tokenAmount"]) / (10 ** int(ra["decimals"]))
-        if -spent < C.COPY_MIN_BUNDLE_SOL:
+        if row.get("err"):
+            _sig_seen.add(sig)
             continue
-        for x in t.get("tokenTransfers", []):
-            m = x.get("mint")
-            if m and m != WSOL:
-                out.append((m, t.get("timestamp", int(time.time()))))
+
+        try:
+            t = await J.rpc(s, "getTransaction",
+                            [sig, {"encoding": "jsonParsed",
+                                   "maxSupportedTransactionVersion": 0}])
+            tx = (t or {}).get("result")
+        except Exception:
+            continue                      # leave it unseen and retry next poll
+        if not tx:
+            _sig_seen.add(sig)
+            continue
+        _sig_seen.add(sig)
+
+        meta = tx.get("meta") or {}
+        if meta.get("err"):
+            continue
+        msg = (tx.get("transaction") or {}).get("message") or {}
+        keys = [k.get("pubkey") if isinstance(k, dict) else k
+                for k in (msg.get("accountKeys") or [])]
+
+        # Did it go through pump.fun at all? Loaded addresses and inner
+        # instructions both count — a bundle is rarely a bare top-level call.
+        touched = PUMP_FUN_PROGRAM in keys or PUMP_FUN_PROGRAM in json.dumps(
+            meta.get("innerInstructions") or [])
+        if not touched:
+            continue
+
+        # What the wallet actually paid: native movement plus any wrapped leg.
+        try:
+            idx = keys.index(wallet)
+        except ValueError:
+            continue
+        pre = (meta.get("preBalances") or [])
+        post = (meta.get("postBalances") or [])
+        if idx >= len(pre) or idx >= len(post):
+            continue
+        spent = (pre[idx] - post[idx]) / 1e9
+        pre_w = {tb.get("accountIndex"): tb for tb in (meta.get("preTokenBalances") or [])
+                 if tb.get("mint") == WSOL and tb.get("owner") == wallet}
+        post_w = {tb.get("accountIndex"): tb for tb in (meta.get("postTokenBalances") or [])
+                  if tb.get("mint") == WSOL and tb.get("owner") == wallet}
+        for i, tb in pre_w.items():
+            a = float((tb.get("uiTokenAmount") or {}).get("uiAmount") or 0)
+            b = float(((post_w.get(i) or {}).get("uiTokenAmount") or {}).get("uiAmount") or 0)
+            spent += a - b
+
+        if spent < C.COPY_MIN_BUNDLE_SOL:
+            continue
+
+        # The mint it received: a non-WSOL balance the wallet did not hold before.
+        got = None
+        had = {tb.get("mint") for tb in (meta.get("preTokenBalances") or [])
+               if tb.get("owner") == wallet}
+        for tb in (meta.get("postTokenBalances") or []):
+            m = tb.get("mint")
+            if not m or m == WSOL or tb.get("owner") != wallet:
+                continue
+            amt = float((tb.get("uiTokenAmount") or {}).get("uiAmount") or 0)
+            if amt > 0 and m not in had:
+                got = m
                 break
+        if got:
+            out.append((got, bt or int(now)))
+
+    # Unbounded growth would be a slow leak on a long-running process.
+    if len(_sig_seen) > 4000:
+        for x in list(_sig_seen)[:2000]:
+            _sig_seen.discard(x)
     return out
 
 
 async def _has_pool(s, mint):
-    """True once the coin has an AMM pool — i.e. it actually migrated.
+    """True once the coin can actually be bought — i.e. it migrated.
 
-    Checked on-chain rather than from a launchpad progress field because the
-    pool is the thing that matters: it is what makes the coin buyable and
-    sellable. No pool, no trade, whatever any status flag says.
+    Asked as a Jupiter quote rather than by looking for a pool account, because
+    a route is the thing that matters and it is a strictly stronger test: a pool
+    that exists but cannot be routed is not a pool we can trade, and the buy
+    that follows goes through this same router anyway. If Jupiter will not
+    price it, the bot could not have filled it either.
+
+    Quoted for a nominal amount. We are asking whether a route EXISTS, not what
+    it costs — the real size is quoted again at the buy.
     """
-    d = await _get(s, f"{HELIUS}/addresses/{mint}/transactions"
-                      f"?api-key={C.HELIUS_API_KEY}&limit=30")
-    for t in d or []:
-        if t.get("transactionError"):
-            continue
-        if t.get("source") in ("PUMP_AMM", "METEORA_DAMM_V2", "RAYDIUM"):
-            return True
-    return False
+    try:
+        q = await J.quote(s, J.WSOL, mint, 10_000_000)      # 0.01 SOL, a probe
+    except Exception:
+        return False                        # a refusal is not a migration
+    return bool(q and q.get("outAmount") and int(q["outAmount"]) > 0)
 
 
 async def run(s, arm, live_count):
@@ -205,10 +288,6 @@ async def run(s, arm, live_count):
     be tested on its own.
     """
     global _rules
-    if not C.HELIUS_API_KEY:
-        print("copywatch: no HELIUS_API_KEY — not watching", flush=True)
-        return
-
     _load_seen()
     mode = "LIVE" if not C.DRY_RUN else "DRY"
     # It starts regardless of whether anything is switched on. The follow list
