@@ -207,3 +207,47 @@ GAS_SOL        = 0.0005  # per transaction: network fee + typical priority tip.
                          # A full trade is 3 transactions (buy + 2 take-profits), so
                          # at 0.05 SOL that's ~3% of your position gone to fees before
                          # the price does anything. Raising SIZE_SOL dilutes this drag.
+
+# ── copy a bundler ──────────────────────────────────────────────────────────
+# Follow an operator's launches and greenlight the ones that MIGRATE. The buy
+# is not the trigger — measured over a random 110 of one operator's launches,
+# only 26.4% ever completed the curve, and a coin without a pool cannot be
+# traded at all. Waiting for the pool throws away three quarters of the output
+# and everything it throws away was untradeable. See copywatch.py.
+COPY_ENABLED   = os.environ.get("COPY_ENABLED", "").lower() in ("1", "true", "yes")
+# Comma-separated. These are the operator hubs you follow, not wallets you copy
+# trade-for-trade: what we take from them is WHICH COIN, never their price.
+COPY_WALLETS   = os.environ.get("COPY_WALLETS", "")
+# Per coin. Small on purpose: the edge here is measured at roughly +11% a trade
+# on the one wallet whose real fills we could read, with a wide error bar and a
+# sample of 36. Size for being wrong.
+COPY_SIZE_SOL  = float(os.environ.get("COPY_SIZE_SOL", "0.05"))
+# A hard ceiling that COPY_SIZE_SOL is clamped to. Separate knob so a typo in
+# the tuning number cannot become a position.
+COPY_MAX_SIZE_SOL = float(os.environ.get("COPY_MAX_SIZE_SOL", "0.25"))
+# Which saved strategy runs on these. Empty = your account default, same as a
+# greenlight with no strategy named.
+COPY_PRESET    = os.environ.get("COPY_PRESET", "")
+# Circuit breakers. An operator that suddenly launches 50 coins in an hour is a
+# change in their behaviour, not an invitation.
+COPY_MAX_PER_DAY    = int(os.environ.get("COPY_MAX_PER_DAY", "8"))
+COPY_MAX_CONCURRENT = int(os.environ.get("COPY_MAX_CONCURRENT", "2"))
+# Below this, a bundle buy can't complete the curve, so the coin will never
+# migrate and never signal. Skipping them early just saves half an hour of
+# pointless polling.
+COPY_MIN_BUNDLE_SOL = float(os.environ.get("COPY_MIN_BUNDLE_SOL", "0.8"))
+# Migration lands a median 1.6 min after the bundle buy and p90 is under 5;
+# everything measured arrived inside 30. After that it isn't coming.
+COPY_MIGRATION_TIMEOUT = float(os.environ.get("COPY_MIGRATION_TIMEOUT", "1800"))
+# A signal older than this is history, not a signal — most likely the bot was
+# down. Arming it would buy the part of the curve that loses money.
+COPY_MAX_SIGNAL_AGE = float(os.environ.get("COPY_MAX_SIGNAL_AGE", "900"))
+COPY_POLL_SEC  = float(os.environ.get("COPY_POLL_SEC", "20"))
+# Archival reads: which coins an operator just bundled, and whether one has a
+# pool yet. Nothing here signs or trades.
+HELIUS_API_KEY = os.environ.get("HELIUS_API_KEY", "")
+# Refuse to arm a coin that migrated too long after its bundle buy. Entering
+# late is not a smaller edge, it is the wrong side of one: across 1,500 real
+# wallets on two of these coins, buyers more than ten minutes in won 8-11% of
+# the time and lost 3-5x more than the early band made.
+COPY_MAX_ARM_AGE = float(os.environ.get("COPY_MAX_ARM_AGE", "600"))

@@ -22,6 +22,7 @@ import gas as GAS
 import jupiter as J
 import ultra as U
 import state as S
+import copywatch as CW
 from strategy import Session
 
 LOG = "trades.jsonl"
@@ -1762,6 +1763,12 @@ async def main():
                               f"still want them.")
 
         asyncio.create_task(poll_web_greenlights(s))
+        # Following a bundler is a second source of greenlights, not a second
+        # strategy: it decides WHICH coin and hands it to arm_mint exactly as
+        # the terminal does. Everything after that — the dip, the reclaim, the
+        # size, the exits — is the same code path as a coin you tapped
+        # yourself. Off unless COPY_ENABLED is set.
+        asyncio.create_task(CW.run(s, arm_mint, lambda: len(live_sessions)))
         async def reconcile_loop():
             while True:
                 await asyncio.sleep(RECONCILE_SEC)
