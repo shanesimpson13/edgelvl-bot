@@ -1165,6 +1165,25 @@ async def work_coin(s, sig, resume=None):
                     got, err = await dry_or_live_sell(s, mint, amount, tp_fees, wallet=wallet)
                     await _sweep_wrapped(s, wallet, name)
                     if err:
+                        # The same hole the stop path already closed, left open
+                        # here. A sell can fail because there is nothing left to
+                        # sell -- cancelled from the terminal, or sold from a
+                        # wallet app -- and retrying assumes the opposite. RPONS
+                        # ran to 120 attempts against an empty account while the
+                        # cancel that emptied it had already banked +0.0013 SOL,
+                        # and the position read as "dropped" instead of a win.
+                        # Ask the wallet, then hand it to the drop path, which
+                        # reads the real proceeds off chain and journals them.
+                        if _looks_empty(err):
+                            try:
+                                left = await J.token_balance(s, mint, wallet=wallet)
+                            except Exception:
+                                left = None
+                            if left == 0:
+                                print(f"TP SELL FAILED BUT WALLET EMPTY {name}: "
+                                      f"treating as gone", flush=True)
+                                cancel_mints.add(k)
+                                continue
                         # The rung counted itself as fired before we tried to
                         # sell. Give it back — otherwise one revert silently
                         # retires the only take-profit this position had, and
