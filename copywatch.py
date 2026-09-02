@@ -585,9 +585,20 @@ async def run(s, arm, live_count):
                 # decided when you were calm.
                 size = min(float(rule.get("size_sol") or C.COPY_SIZE_SOL),
                            C.COPY_MAX_SIZE_SOL)
-                preset = rule.get("preset") or None
-                print(f"copywatch: {mint[:12]}… MIGRATED → arming {size} SOL"
-                      f"{' on ' + preset if preset else ''}", flush=True)
+                # "" is a real answer -- the account's own settings, picked
+                # deliberately in the CONFIG column -- and `or None` collapsed it
+                # into "nothing was chosen", which is precisely what makes the
+                # server apply the DEFAULT preset instead. Every copy arm ran
+                # STAPLE's -40% dip while the terminal said SCALP (-30%).
+                # Only a missing key means "nothing chosen".
+                preset = rule.get("preset")
+                # Name the config out loud. The old line printed nothing for
+                # "" -- the most common value -- so an arm running the wrong
+                # strategy looked identical to one running the right one.
+                _cfg = preset if preset else ("your own settings" if preset == ""
+                                              else "the default strategy")
+                print(f"copywatch: {mint[:12]}… MIGRATED → arming {size} SOL "
+                      f"on {_cfg}", flush=True)
                 # Supplied, not looked up: the board has no row for a coin
                 # this new. None falls back to the board lookup, which is the
                 # right behaviour for a coin that HAS aged onto it.
