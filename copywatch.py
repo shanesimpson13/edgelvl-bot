@@ -458,6 +458,44 @@ async def _coin_record(s, mint):
     }
 
 
+BOARD_FILE = os.environ.get("TRENDING_FILE",
+                           "/home/ubuntu/scg-alpha-engine/trending.json")
+
+
+def _board_mints():
+    """Mints currently on the board, or None if the board can't be read.
+
+    None is not an empty board: a missing or half-written file must not read as
+    "nothing qualifies", or the watcher silently refuses everything.
+    """
+    try:
+        with open(BOARD_FILE) as f:
+            d = json.load(f)
+        coins = d.get("coins") if isinstance(d, dict) else d
+        return {c.get("mint") for c in (coins or []) if c.get("mint")}
+    except Exception:
+        return None
+
+
+def _on_board(mint):
+    """Is this coin on the board?
+
+    This replaces the Jupiter-quote "has it migrated" test, which never tested
+    migration at all: Jupiter routes bonding-curve trades, so the quote
+    succeeds on a coin that has not graduated. Two LUNA positions were opened
+    on coins 0.4% along the curve, and both went to zero.
+
+    The board floor is TRENDING_PRE_MIN_MC ($40,000) and migration is 411 SOL
+    ($40,572 at the time of writing) -- the same number. So board membership
+    already means migrated AND liquid enough to have been ranked, which is
+    strictly stronger than either test alone, and it is a local file read.
+    """
+    mints = _board_mints()
+    if mints is None:
+        return False                    # unreadable board: refuse, do not guess
+    return mint in mints
+
+
 async def _has_pool(s, mint):
     """True once the coin can actually be bought — i.e. it migrated.
 
@@ -547,7 +585,8 @@ async def run(s, arm, live_count):
                     print(f"copywatch: {mint[:12]}… window closed after "
                           f"{int(now - ts)}s, dropped", flush=True)
                     continue
-                if not await _has_pool(s, mint):
+                # Board membership, not a Jupiter quote. See _on_board.
+                if not _on_board(mint):
                     continue
 
                 del _candidates[mint]
@@ -568,11 +607,7 @@ async def run(s, arm, live_count):
 
                 # Rails. Each one is a reason to refuse, checked out loud so a
                 # quiet day is distinguishable from a broken watcher.
-                if _budget_left(rule) <= 0:
-                    print(f"copywatch: {mint[:12]}… migrated but {rule['wallet'][:8]}…"
-                          f" has spent its daily cap ({rule.get('max_per_day')})",
-                          flush=True)
-                    continue
+                # Daily cap removed at the owner's request.
                 open_now = live_count()
                 if open_now >= max_concurrent:
                     print(f"copywatch: {mint[:12]}… migrated but {open_now} "
