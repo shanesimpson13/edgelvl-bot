@@ -64,7 +64,35 @@ _rules = []
 # WHICH row found it, because size, strategy and daily cap are per wallet.
 _candidates = {}
 # Armed today, per rule. (day, {rule_id: count})
+# Persisted: this is a spending cap, not a counter. Held only in memory it
+# reset on every restart, so a deploy handed each wallet a fresh day's budget
+# -- and a bot that restarts twice can take three times the trades you agreed
+# to. The day is stored with it so yesterday's tally cannot be mistaken for
+# today's.
 _armed_today = [None, {}]
+_daily_path = os.path.join(os.path.dirname(_seen_path), "copy_armed_today.json")
+
+
+def _load_daily():
+    try:
+        with open(_daily_path) as f:
+            d = json.load(f)
+        if d.get("day") == _today():
+            _armed_today[0] = d["day"]
+            _armed_today[1] = {str(k): int(v) for k, v in (d.get("counts") or {}).items()}
+    except Exception:
+        pass
+
+
+def _save_daily():
+    try:
+        os.makedirs(os.path.dirname(_daily_path), exist_ok=True)
+        tmp = _daily_path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"day": _armed_today[0], "counts": _armed_today[1]}, f)
+        os.replace(tmp, _daily_path)
+    except Exception:
+        pass
 
 
 def _load_seen():
@@ -140,6 +168,7 @@ def _budget_left(rule):
     if _armed_today[0] != _today():
         _armed_today[0] = _today()
         _armed_today[1] = {}
+        _save_daily()
     used = _armed_today[1].get(rule["id"], 0)
     return int(rule.get("max_per_day", 8)) - used
 
@@ -457,6 +486,7 @@ async def run(s, arm, live_count):
     """
     global _rules
     _load_seen()
+    _load_daily()
     mode = "LIVE" if not C.DRY_RUN else "DRY"
     # It starts regardless of whether anything is switched on. The follow list
     # comes from the terminal now, so a watcher that refused to start on an
@@ -574,6 +604,7 @@ async def run(s, arm, live_count):
                 if ok:
                     _budget_left(rule)          # rolls the day over if needed
                     _armed_today[1][rule["id"]] = _armed_today[1].get(rule["id"], 0) + 1
+                    _save_daily()
 
             await _push_status(s)
             await asyncio.sleep(C.COPY_POLL_SEC)
