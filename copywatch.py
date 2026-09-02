@@ -70,6 +70,7 @@ _candidates = {}
 # to. The day is stored with it so yesterday's tally cannot be mistaken for
 # today's.
 _armed_today = [None, {}]
+_last_feed_warn = [0.0]
 _daily_path = os.path.join(os.path.dirname(_seen_path), "copy_armed_today.json")
 
 
@@ -496,6 +497,36 @@ def _on_board(mint):
     return mint in mints
 
 
+CANDS_FILE = os.environ.get("COPY_CANDS_FILE",
+                            "/home/ubuntu/scg-alpha-engine/copy_candidates.json")
+CANDS_STALE_SEC = float(os.environ.get("COPY_CANDS_STALE_SEC", "180"))
+
+
+def _feed():
+    """Followed-wallet buys, as written by the board collector.
+
+    The collector polls the wallets on the board's own cycle, so this process
+    makes no GMGN calls at all. Two pollers with separate backoffs, neither
+    aware of the other, is what banned the IP.
+
+    Returns None -- not [] -- when the file is missing, unreadable or stale, so
+    a dead collector reads as "we do not know" rather than "no wallet bought
+    anything". Those look identical from here and only one is safe.
+    """
+    try:
+        with open(CANDS_FILE) as f:
+            d = json.load(f)
+    except Exception:
+        return None
+    try:
+        age = time.time() - float(d.get("generated_at") or 0)
+    except (TypeError, ValueError):
+        return None
+    if age > CANDS_STALE_SEC:
+        return None
+    return d.get("candidates") or []
+
+
 async def _has_pool(s, mint):
     """True once the coin can actually be bought — i.e. it migrated.
 
@@ -549,21 +580,36 @@ async def run(s, arm, live_count):
 
             # 1 — new bundle buys become candidates, tagged with the row that
             #     found them so the arm uses that row's size and strategy.
-            for rule in _rules:
-                w = rule["wallet"]
-                for mint, ts in await _bundle_buys(s, w):
-                    if mint in _seen or mint in _candidates:
-                        continue
+            feed = _feed()
+            if feed is None:
+                # Say it once a minute, not every cycle: a silent watcher and a
+                # blind one look the same, and only one is fine.
+                if now - _last_feed_warn[0] > 60:
+                    _last_feed_warn[0] = now
+                    print("copywatch: no fresh candidate feed from the collector "
+                          "— not arming anything until it returns", flush=True)
+                await _push_status(s)
+                await asyncio.sleep(C.COPY_POLL_SEC)
+                continue
+            by_wallet = {r["wallet"]: r for r in _rules}
+            for c in feed:
+                rule = by_wallet.get(c.get("wallet"))
+                if rule is None:
+                    continue                     # wallet switched off since
+                mint, ts = c.get("mint"), float(c.get("ts") or 0)
+                if not mint or mint in _seen or mint in _candidates:
+                    continue
                     # Ignore anything that was already old when we found it. A
                     # coin whose migration window closed while the bot was down
                     # is not a signal, it is history — and arming it would buy
                     # the part of the curve that loses money.
-                    if now - ts > C.COPY_MAX_SIGNAL_AGE:
-                        _seen.add(mint)
-                        continue
-                    _candidates[mint] = {"ts": ts, "rule": rule["id"], "wallet": w}
-                    print(f"copywatch: {mint[:12]}… bundled by {w[:8]}…, "
-                          f"waiting for migration", flush=True)
+                if now - ts > C.COPY_MAX_SIGNAL_AGE:
+                    _seen.add(mint)
+                    continue
+                _candidates[mint] = {"ts": ts, "rule": rule["id"],
+                                     "wallet": rule["wallet"]}
+                print(f"copywatch: {mint[:12]}… bundled by {rule['wallet'][:8]}…, "
+                      f"waiting for the board", flush=True)
 
             # 2 — candidates that migrated get armed; the rest time out.
             for mint, cand in list(_candidates.items()):
