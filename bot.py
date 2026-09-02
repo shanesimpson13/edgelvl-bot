@@ -364,7 +364,7 @@ def is_paused():
         return False
 
 
-async def arm_mint(s, mint, user=None, wallet_id=None, fee_bps=None, opts=None):
+async def arm_mint(s, mint, user=None, wallet_id=None, fee_bps=None, opts=None, sig=None):
     """Start working a coin. Every greenlight from the terminal lands here.
 
     Every outcome is logged, including the failures — a greenlight that quietly
@@ -398,7 +398,13 @@ async def arm_mint(s, mint, user=None, wallet_id=None, fee_bps=None, opts=None):
         await note(s, "Already working that one.")
         return False
 
-    sig = pending_tap.pop(mint, None)
+    # A caller holding the coin record already passes it in. copytrade does:
+    # it finds a coin AT MIGRATION, earlier than the board's filters admit, so
+    # resolving against the board refuses exactly the coins the watcher exists
+    # to catch -- and the earlier it detects, the surer the refusal. Two live
+    # arms failed this way before this parameter existed.
+    if sig is None:
+        sig = pending_tap.pop(mint, None)
     if sig is None:
         sig = await lookup_coin(s, mint)
     if sig is None:

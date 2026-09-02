@@ -358,6 +358,77 @@ async def _chain_buys(s, wallet):
     return out
 
 
+async def _coin_record(s, mint):
+    """The coin, shaped like a board row, for a coin the board has never seen.
+
+    copytrade catches coins AT MIGRATION -- below TRENDING_PRE_MIN_MC, so the
+    board has no row to look up and the arm was refused outright. Rather than
+    teach the API to fetch (it is a file read by design, and making a public
+    route hit GMGN hands anyone our rate limit), the watcher supplies what it
+    already has the key to ask for.
+
+    Returns None if GMGN cannot answer, so the caller can still fall back to
+    the board lookup instead of arming against a half-built record.
+    """
+    if not C.WATCH_GMGN_KEY:
+        return None
+    if time.time() < _gmgn_quiet_until[0]:
+        return None
+    try:
+        params = {"chain": "sol", "address": mint,
+                  "timestamp": str(int(time.time())),
+                  "client_id": str(uuid.uuid4())}
+        async with s.get(f"{GMGN_API}/v1/token/info", params=params,
+                         headers={"X-APIKEY": C.WATCH_GMGN_KEY,
+                                  "User-Agent": "Mozilla/5.0"},
+                         timeout=aiohttp.ClientTimeout(total=15)) as r:
+            if r.status != 200:
+                return None
+            t = ((await r.json()) or {}).get("data") or {}
+    except Exception as e:
+        print(f"copywatch: token info for {mint[:8]}…: {e}", flush=True)
+        return None
+    if not t:
+        return None
+
+    px = t.get("price") or {}
+
+    def _f(v):
+        try:
+            return float(v or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    supply = _f(t.get("circulating_supply")) or _f(t.get("total_supply"))
+    price = _f(px.get("price")) or _f(t.get("price"))
+    buys = int(_f(px.get("buys_5m")))
+    sells = int(_f(px.get("sells_5m")))
+    bvol, svol = _f(px.get("buy_volume_5m")), _f(px.get("sell_volume_5m"))
+    # A brand-new coin legitimately has no 5m history. Report what is there and
+    # let the strategy decide -- do not invent momentum it has not shown.
+    return {
+        "mint": mint,
+        "name": t.get("symbol") or t.get("name") or mint[:8],
+        "symbol": t.get("symbol") or "",
+        "logo": t.get("logo") or "",
+        "mcap": round(price * supply, 2),
+        "price": price,
+        "liq": _f(t.get("liquidity")),
+        "vol_5m": _f(px.get("volume_5m")),
+        "buys_5m": buys,
+        "sells_5m": sells,
+        "swaps_5m": buys + sells,
+        "buy_vol_5m": bvol,
+        "sell_vol_5m": svol,
+        "volr": round(bvol / svol, 3) if svol else 0.0,
+        "holders": int(_f(t.get("holder_count"))),
+        "top10_pct": round(_f(t.get("top_10_holder_rate")) * 100, 1),
+        "launchpad": t.get("launchpad_platform") or t.get("launchpad") or "",
+        # So a row that came from here is identifiable downstream.
+        "source": "copywatch",
+    }
+
+
 async def _has_pool(s, mint):
     """True once the coin can actually be bought — i.e. it migrated.
 
@@ -487,8 +558,16 @@ async def run(s, arm, live_count):
                 preset = rule.get("preset") or None
                 print(f"copywatch: {mint[:12]}… MIGRATED → arming {size} SOL"
                       f"{' on ' + preset if preset else ''}", flush=True)
+                # Supplied, not looked up: the board has no row for a coin
+                # this new. None falls back to the board lookup, which is the
+                # right behaviour for a coin that HAS aged onto it.
+                record = await _coin_record(s, mint)
+                if record is None:
+                    print(f"copywatch: {mint[:12]}… no token info — "
+                          f"falling back to the board lookup", flush=True)
                 try:
-                    ok = await arm(s, mint, opts={"size_sol": size, "preset": preset})
+                    ok = await arm(s, mint, opts={"size_sol": size, "preset": preset},
+                                   sig=record)
                 except Exception as e:
                     print(f"copywatch: arm error {mint[:8]}: {e}", flush=True)
                     ok = False
