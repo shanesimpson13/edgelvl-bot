@@ -305,13 +305,18 @@ async def sol_usd(s, ttl=60.0):
     return _sol_usd[1] or None
 
 
-async def mc_scale(s, mint):
+async def mc_scale(s, mint, supply=None):
     """Multiply a SOL-per-token price by this to get a market cap in dollars.
 
-    supply x SOL/USD, both sourced directly. Returns None if either is missing,
-    and the caller keeps whatever it had — a stale scale beats no figures.
+    supply x SOL/USD. Returns None if either is missing, and the caller keeps
+    whatever it had — a stale scale beats no figures.
+
+    `supply` lets a caller pass a number it already holds. A board row carries
+    mcap and price for the same instant, so supply is mcap/price — and pump.fun
+    supply is fixed at launch. Fetching getTokenSupply per fill was an RPC round
+    trip for a constant already in memory.
     """
-    sup = await token_supply(s, mint)
+    sup = supply or await token_supply(s, mint)
     su = await sol_usd(s)
     return (sup * su) if (sup and su) else None
 

@@ -690,6 +690,21 @@ async def dry_or_live_sell(s, mint, raw_amount, fees=None, wallet=None):
 
 
 # ── working a single coin ───────────────────────────────────────────────────
+def _supply_from_row(sig):
+    """Token supply implied by the coin row: mcap = price x supply.
+
+    The row carries both for the same instant, and pump.fun supply never
+    changes after launch, so this is exact rather than an estimate. Returns
+    None when the row cannot answer and mc_scale falls back to the chain.
+    """
+    try:
+        mc = float(sig.get("mcap") or 0)
+        px = float(sig.get("price") or 0)
+        return (mc / px) if mc > 0 and px > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
 async def work_coin(s, sig, resume=None):
     """From your tap until we're flat. One task per coin.
 
@@ -972,7 +987,7 @@ async def work_coin(s, sig, resume=None):
                 # so it does not wobble, and our figures stop depending on when
                 # GMGN last refreshed. Frozen once in a position so entry, the
                 # rungs and the live cap stay a consistent set.
-                scale = await J.mc_scale(s, mint)
+                scale = await J.mc_scale(s, mint, supply=_supply_from_row(sig))
                 if scale and not factor_locked:
                     mc_factor = scale
                 if scale or fresh:
@@ -1085,12 +1100,16 @@ async def work_coin(s, sig, resume=None):
                     # from supply and the SOL price rather than borrowed. This
                     # is the number GMGN's trade row shows, because it carries
                     # our own price impact rather than quoting spot beside it.
-                    scale = await J.mc_scale(s, mint)
+                    scale = await J.mc_scale(s, mint, supply=_supply_from_row(sig))
                     if scale:
                         mc_factor = scale
                     if fill_px and mc_factor:
+                        # "from the fill" -- not from the chain. fill_px is
+                        # cost/tokens off Jupiter's own swap result; saying
+                        # "on chain" sent me hunting for an RPC dependency that
+                        # execution does not have.
                         print(f"ENTRY MC {name}: {fill_px * mc_factor:,.0f} "
-                              f"from the fill price on chain", flush=True)
+                              f"from the fill price Jupiter returned", flush=True)
                     entry_mc, tp_mcs = "—", []
                     _freeze_entry()
                     tokens_original = got        # the ladder is fractions of THIS
