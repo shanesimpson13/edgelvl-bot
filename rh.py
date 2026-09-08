@@ -175,7 +175,14 @@ async def quote(s, from_token, to_token, amount_raw, taker, slippage=None,
     }
     if INTEGRATOR:
         params["integrator"] = INTEGRATOR
-        bps = int(getattr(C, "FEE_BPS", 0) if fee_bps is None else fee_bps)
+        # fee_bps is what the CUSTOMER should pay in total, the same number on
+        # every chain. Jupiter's referral fee replaces its own 2bps baseline, so
+        # on Solana our cut is that whole number. LI.FI instead charges its
+        # 0.25% on top of ours, so here we ask for the remainder -- 0.5% to the
+        # customer means 0.25% to us. Zero stays zero, which is how an exempt
+        # wallet is expressed.
+        want = int(getattr(C, "FEE_BPS", 0) if fee_bps is None else fee_bps)
+        bps = max(0, want - int(getattr(C, "LIFI_BASE_BPS", 25)))
         if bps > 0:
             params["fee"] = f"{bps / 10000.0:.6f}"
     try:

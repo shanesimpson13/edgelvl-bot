@@ -94,6 +94,12 @@ JUP_COOLDOWN   = 20.0    # seconds to back off after a 429 before trying again
 LIFI_API_KEY   = os.environ.get("LIFI_API_KEY", "")
 RH_INTEGRATOR  = os.environ.get("RH_INTEGRATOR", "")
 
+# LI.FI takes this much on every route before we add anything. Our own cut is
+# the difference between it and what the customer should pay, so the headline
+# 0.5% is the whole cost of a swap and not our share of a larger one. Measured,
+# not assumed: a quote with no fee of ours comes back with feeCosts 0.0025.
+LIFI_BASE_BPS  = int(os.environ.get("LIFI_BASE_BPS", "25"))
+
 # ── platform fee ────────────────────────────────────────────────────────────
 # Taken by Jupiter on each swap and paid to FEE_ACCOUNT. Off until an account is
 # set, so it can never quietly charge anyone.
