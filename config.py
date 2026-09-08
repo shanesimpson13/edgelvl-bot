@@ -85,6 +85,15 @@ JUP_HOST       = os.environ.get("JUP_HOST", "https://api.jup.ag/swap/v1")
 JUP_MAX_RPS    = float(os.environ.get("JUP_MAX_RPS", "1.0" if os.environ.get("JUP_API_KEY") else "0.5"))
 JUP_COOLDOWN   = 20.0    # seconds to back off after a 429 before trying again
 
+# ── Robinhood Chain routing ─────────────────────────────────────────────────
+# The key identifies us to LI.FI for rate limits. Taking a cut of a swap is a
+# separate thing: that needs an integrator name registered at portal.li.fi with
+# a fee wallet attached, and quoting with an unregistered name is a hard 400.
+# So RH_INTEGRATOR stays empty until that is done, and rh.py sends no fee
+# parameters at all while it is.
+LIFI_API_KEY   = os.environ.get("LIFI_API_KEY", "")
+RH_INTEGRATOR  = os.environ.get("RH_INTEGRATOR", "")
+
 # ── platform fee ────────────────────────────────────────────────────────────
 # Taken by Jupiter on each swap and paid to FEE_ACCOUNT. Off until an account is
 # set, so it can never quietly charge anyone.
