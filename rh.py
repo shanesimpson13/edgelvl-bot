@@ -44,7 +44,14 @@ NATIVE = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
 
 PRICE_TTL = float(getattr(C, "PRICE_TTL", 0.9))
 SLIPPAGE  = float(getattr(C, "RH_SLIPPAGE", 0.15))
-NO_ROUTE  = "no_route"      # fraction, LI.FI wants 0.15 not 1500
+NO_ROUTE  = "no_route"
+
+# LI.FI only pays an integrator fee to a name registered at portal.li.fi with a
+# fee wallet attached; sending `fee` under an unregistered name is a hard 400,
+# not a silent no-op. So the fee rides along only once RH_INTEGRATOR is set,
+# and the swap still works untaxed before that rather than failing closed.
+# Note LI.FI already takes its own ~0.25% on these routes -- ours is on top.
+INTEGRATOR = (getattr(C, "RH_INTEGRATOR", "") or "").strip()      # fraction, LI.FI wants 0.15 not 1500
 
 # selector constants
 SEL_BALANCE_OF = "0x70a08231"
@@ -152,7 +159,8 @@ def _hdrs():
     return {"x-lifi-api-key": LIFI_KEY} if LIFI_KEY else {}
 
 
-async def quote(s, from_token, to_token, amount_raw, taker, slippage=None):
+async def quote(s, from_token, to_token, amount_raw, taker, slippage=None,
+                fee_bps=None):
     """A LI.FI route, including a ready-to-send transactionRequest.
 
     Returns (quote_dict, error). Same-chain only: fromChain == toChain, because
@@ -165,6 +173,11 @@ async def quote(s, from_token, to_token, amount_raw, taker, slippage=None):
         "fromAddress": taker,
         "slippage": str(slippage if slippage is not None else SLIPPAGE),
     }
+    if INTEGRATOR:
+        params["integrator"] = INTEGRATOR
+        bps = int(getattr(C, "FEE_BPS", 0) if fee_bps is None else fee_bps)
+        if bps > 0:
+            params["fee"] = f"{bps / 10000.0:.6f}"
     try:
         async with s.get(f"{LIFI}/quote", params=params, headers=_hdrs(),
                          timeout=aiohttp.ClientTimeout(total=20)) as r:
@@ -347,13 +360,14 @@ async def _ensure_allowance(s, w, mint, spender, need):
     return None
 
 
-async def _swap(s, mint_in, mint_out, amount_raw, wallet, slippage_bps=None):
+async def _swap(s, mint_in, mint_out, amount_raw, wallet, slippage_bps=None,
+                fee_bps=None):
     """One swap. Returns (out_raw, tx_hash, gas_eth, error)."""
     w = _w(wallet)
     if w is None:
         return 0, None, None, "no_wallet"
     slip = (slippage_bps / 10000.0) if slippage_bps else None
-    q, err = await quote(s, mint_in, mint_out, amount_raw, w.address, slip)
+    q, err = await quote(s, mint_in, mint_out, amount_raw, w.address, slip, fee_bps)
     if err or not q:
         return 0, None, None, err or "no_route"
 
@@ -432,7 +446,7 @@ async def execute_buy(s, mint, eth_amount, wallet=None,
     ignored -- this chain prices gas, not tips.
     """
     got, _h, gas, err = await _swap(s, NATIVE, mint, int(float(eth_amount) * 1e18),
-                                    wallet, slippage_bps)
+                                    wallet, slippage_bps, fee_bps)
     if err == NO_ROUTE:
         # Say which it is. "No route" on a coin whose sells work is a size
         # problem, and the caller can offer a size that would have worked
@@ -449,7 +463,7 @@ async def execute_sell(s, mint, raw_amount, wallet=None,
                        slippage_bps=None, priority_lamps=None, fee_bps=None):
     """Sell tokens back to native ETH. Returns (eth_out, error, gas_eth)."""
     out, _h, gas, err = await _swap(s, mint, NATIVE, int(raw_amount),
-                                    wallet, slippage_bps)
+                                    wallet, slippage_bps, fee_bps)
     if err:
         return 0.0, err, gas
     return (out or 0) / 1e18, None, gas
