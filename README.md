@@ -5,6 +5,14 @@ The semi-automated trading system from the [EdgeLvl](https://edgelvl.app) playbo
 **Signals arrive in Telegram → you tap 🟢 GREENLIGHT → the bot handles entry timing and exits.**
 Nothing trades without your tap.
 
+One of three repos:
+
+| Repo | What it is |
+|---|---|
+| this one | the trading system — strategy, executors, custody signing |
+| [edgelvl-terminal](https://github.com/shanesimpson13/edgelvl-terminal) | the terminal you look at |
+| [edgelvl-api](https://github.com/shanesimpson13/edgelvl-api) | the server between them |
+
 ## Files
 
 | File | What it does |
