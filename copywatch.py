@@ -459,8 +459,10 @@ async def _coin_record(s, mint):
     }
 
 
-BOARD_FILE = os.environ.get("TRENDING_FILE",
-                           "/home/ubuntu/scg-alpha-engine/trending.json")
+# The board snapshot, written by the collector. A path in rather than
+# something this process owns, so it is named by the deployment.
+BOARD_DIR = os.environ.get("EDGELVL_BOARD_DIR", "/home/ubuntu/board")
+BOARD_FILE = os.environ.get("TRENDING_FILE", f"{BOARD_DIR}/trending.json")
 
 
 def _board_mints():
@@ -498,7 +500,7 @@ def _on_board(mint):
 
 
 CANDS_FILE = os.environ.get("COPY_CANDS_FILE",
-                            "/home/ubuntu/scg-alpha-engine/copy_candidates.json")
+                            f"{BOARD_DIR}/copy_candidates.json")
 CANDS_STALE_SEC = float(os.environ.get("COPY_CANDS_STALE_SEC", "180"))
 
 
