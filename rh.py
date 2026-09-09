@@ -30,6 +30,7 @@ import time
 import aiohttp
 
 import config as C
+import privy
 
 RPC_URL   = getattr(C, "RH_RPC_URL", "https://rpc.mainnet.chain.robinhood.com")
 CHAIN_ID  = int(getattr(C, "RH_CHAIN_ID", 4663))
@@ -60,7 +61,10 @@ SEL_ALLOWANCE  = "0xdd62ed3e"
 SEL_APPROVE    = "0x095ea7b3"
 MAX_UINT       = (1 << 256) - 1
 
+PROBE_USD = float(getattr(C, "RH_PROBE_USD", 10.0))   # price probes are real orders
+
 _px_cache: dict = {}
+_probe: dict = {}
 _dec_cache: dict = {}
 _held: set = set()
 
@@ -85,9 +89,17 @@ def _pad(addr_or_int):
     return format(int(addr_or_int), "064x")
 
 
+# The bot's own Robinhood-chain wallet, held by Privy. Built from ids alone so
+# importing this module never needs the network -- an executor that cannot be
+# imported offline is an executor that fails at the worst moment.
+WALLET = (privy.PrivyEvmWallet(C.RH_WALLET_ID, C.RH_ADDRESS)
+          if getattr(C, "RH_WALLET_ID", "") and getattr(C, "RH_ADDRESS", "")
+          else None)
+
+
 def _w(wallet):
     """The wallet to act as: the one passed, or the environment's."""
-    return wallet if wallet is not None else getattr(C, "RH_WALLET", None)
+    return wallet if wallet is not None else WALLET
 
 
 def hold(mint):
@@ -215,9 +227,16 @@ async def get_price(s, mint):
     d = await decimals(s, mint)
     if d is None:
         return None
-    probe = 10 ** d                                    # one whole token
     w = _w(None)
     taker = w.address if w else "0x0000000000000000000000000000000000000001"
+
+    probe = _probe.get(mint)
+    if probe is None:
+        probe = await _size_probe(s, mint, d, taker)
+        if probe is None:
+            return _px_cache.get(mint, (0, None))[1]
+        _probe[mint] = probe
+
     q, err = await quote(s, mint, NATIVE, probe, taker)
     if err or not q:
         return _px_cache.get(mint, (0, None))[1]       # stale beats nothing
@@ -227,9 +246,32 @@ async def get_price(s, mint):
         return None
     if out <= 0:
         return None
-    px = out / 1e18
+    px = (out / 1e18) / (probe / 10 ** d)              # ETH per WHOLE token
     _px_cache[mint] = (time.time(), px)
     return px
+
+
+async def _size_probe(s, mint, d, taker):
+    """How many raw tokens to quote when reading this coin's price.
+
+    A one-token probe is dust on anything under a cent, and LI.FI prices dust
+    arbitrarily -- the same coin came back at 1.16e-06 ETH and at 8.58e-14 ETH
+    minutes apart, a factor of thirteen million, which as a stop check would
+    have sold instantly. So the size is derived once from a real order: quote
+    PROBE_USD of ETH into the coin and reuse the tokens that buys. Returns None
+    when even that will not route, leaving the caller on its last good price.
+    """
+    usd = await eth_usd(s)
+    if not usd:
+        return None
+    q, err = await quote(s, NATIVE, mint, int(PROBE_USD / usd * 1e18), taker)
+    if err or not q:
+        return None
+    try:
+        got = int((q.get("estimate") or {}).get("toAmount") or 0)
+    except (TypeError, ValueError):
+        return None
+    return got if got > 0 else None
 
 
 async def mc_scale(s, mint, supply=None):
