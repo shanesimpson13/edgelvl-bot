@@ -120,10 +120,6 @@ LIFI_BASE_BPS  = int(os.environ.get("LIFI_BASE_BPS", "25"))
 FEE_ACCOUNT    = os.environ.get("FEE_ACCOUNT", "")
 FEE_BPS        = int(os.environ.get("FEE_BPS", "100"))      # 100 = 1%
 
-# Gas sponsor. When set, we build the swap ourselves and this key pays the
-# network fee, so a customer never needs native SOL and every lamport they
-# deposit can stay wrapped and tradeable.
-SPONSOR_SECRET = os.environ.get("SPONSOR_SECRET", "")
 
 # ── where state lives ───────────────────────────────────────────────────────
 # Open positions are written here after every change so a crash or restart
