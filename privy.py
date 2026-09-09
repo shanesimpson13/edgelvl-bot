@@ -258,6 +258,100 @@ async def provision(s, owner, bot_public_key=None, bot_private_key=None):
     return PrivyWallet(w["id"], w["address"], policy_id=pol["id"]), None
 
 
+def _n(v):
+    """int from either an 0x-hex string or a number."""
+    if isinstance(v, str):
+        return int(v, 16) if v.startswith("0x") else int(v)
+    return int(v)
+
+
+def _to_privy_tx(tx):
+    """Translate a standard EVM JSON-RPC tx into Privy's schema.
+
+    Privy wants snake_case keys and integers, and rejects the camelCase hex
+    that every other EVM tool speaks. Doing the translation here keeps the
+    executor talking plain JSON-RPC, so swapping in a local key later needs no
+    change on its side.
+    """
+    out = {"chain_id": _n(tx.get("chainId") or tx.get("chain_id") or 0)}
+    if tx.get("to"):
+        out["to"] = tx["to"]
+    data = tx.get("data")
+    if data and data != "0x":
+        out["data"] = data
+    out["value"] = _n(tx.get("value", 0) or 0)
+    if tx.get("nonce") is not None:
+        out["nonce"] = _n(tx["nonce"])
+    gas = tx.get("gas") or tx.get("gasLimit") or tx.get("gas_limit")
+    if gas is not None:
+        out["gas_limit"] = _n(gas)
+    gp = tx.get("gasPrice") or tx.get("gas_price")
+    if gp is not None:
+        out["gas_price"] = _n(gp)
+        out["type"] = 0
+    else:
+        mf = tx.get("maxFeePerGas") or tx.get("max_fee_per_gas")
+        mp = tx.get("maxPriorityFeePerGas") or tx.get("max_priority_fee_per_gas")
+        if mf is not None:
+            out["max_fee_per_gas"] = _n(mf)
+            out["max_priority_fee_per_gas"] = _n(mp if mp is not None else 0)
+            out["type"] = 2
+    return out
+
+
+class PrivyEvmWallet:
+    """The bot's own EVM wallet on Robinhood Chain.
+
+    Privy holds the key and signs on request; nothing secret sits on this box.
+    Shaped to what rh.py asks of a wallet -- an `address` and a `sign_tx` that
+    returns raw signed bytes -- so the executor does not care who is holding
+    the key.
+    """
+
+    kind = "privy-evm"
+
+    def __init__(self, wallet_id, address, auth_key=None):
+        self.wallet_id = wallet_id
+        self.address = address
+        self.auth_key = auth_key or getattr(C, "PRIVY_AUTH_PRIVATE_KEY", None)
+
+    def __repr__(self):
+        return f"PrivyEvmWallet({self.address[:10]}…, id={self.wallet_id[:8]}…)"
+
+    @classmethod
+    async def load(cls, s, wallet_id):
+        d, err = await _call(s, "GET", f"/v1/wallets/{wallet_id}")
+        if err:
+            raise RuntimeError(f"privy evm load failed: {err} {str(d)[:160]}")
+        # A Solana wallet id here means the caller mixed up the chains. Refuse
+        # it rather than half-building a swap the wallet can never sign -- and
+        # never quietly fall back to the bot's own wallet, which would spend
+        # our money on a customer's greenlight.
+        if d.get("chain_type") != "ethereum":
+            raise RuntimeError(f"wallet {wallet_id[:10]}… is "
+                               f"{d.get('chain_type')}, not an EVM wallet")
+        return cls(d["id"], d["address"])
+
+    async def sign_tx(self, s, tx):
+        """Sign one EVM transaction. Returns (raw_signed_hex, error).
+
+        A refusal is an outcome, not an exception: the trade does not happen and
+        retrying would fail the same way.
+        """
+        body = {"method": "eth_signTransaction",
+                "params": {"transaction": _to_privy_tx(tx)}}
+        d, err = await _call(s, "POST", f"/v1/wallets/{self.wallet_id}/rpc",
+                             body, auth_key=self.auth_key)
+        if err:
+            return None, f"privy_sign:{err}:{str(d)[:120]}"
+        data = d.get("data") or d
+        raw = (data.get("signed_transaction") or data.get("signedTransaction")
+               or data.get("signature"))
+        if not raw:
+            return None, f"privy_no_signature:{str(d)[:140]}"
+        return raw, None
+
+
 class LocalWallet:
     """The original signer: a private key in the bot's own environment.
 
