@@ -93,6 +93,12 @@ JUP_COOLDOWN   = 20.0    # seconds to back off after a 429 before trying again
 # parameters at all while it is.
 LIFI_API_KEY   = os.environ.get("LIFI_API_KEY", "")
 RH_INTEGRATOR  = os.environ.get("RH_INTEGRATOR", "")
+# Robinhood gas, used only when a receipt could not be read. Its L2 fees
+# are a rounding error next to Solana's, so a SOL-sized guess would
+# overstate every fill.
+RH_GAS_ETH     = float(os.environ.get("RH_GAS_ETH", "0.000002"))
+RH_WALLET_ID   = os.environ.get("RH_WALLET_ID", "")
+RH_ADDRESS     = os.environ.get("RH_ADDRESS", "")
 
 # LI.FI takes this much on every route before we add anything. Our own cut is
 # the difference between it and what the customer should pay, so the headline

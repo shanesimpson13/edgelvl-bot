@@ -20,10 +20,103 @@ import aiohttp
 import config as C
 import gas as GAS
 import jupiter as J
+import rh as RH
+import privy
 import ultra as U
 import state as S
 import copywatch as CW
 from strategy import Session
+
+def ex(mint):
+    """The executor for a coin, decided by the address itself.
+
+    An 0x address can only be Robinhood chain and a base58 mint can only be
+    Solana, so every coin carries its own routing. No chain field to set, and
+    so no way for a missing one to send a trade down the wrong chain. Both
+    modules expose the same calls, so the caller does not branch beyond this.
+    """
+    return RH if isinstance(mint, str) and mint.startswith("0x") else J
+
+
+def _native(mint):
+    """The coin's chain's own currency: SOL on Solana, ETH on Robinhood."""
+    X = ex(mint)
+    return RH.NATIVE if X is RH else J.WSOL
+
+
+async def _unit(s, mint):
+    """(name, raw-per-whole) for the currency a coin trades against.
+
+    Everything downstream -- spent, received, the fill price, the P&L -- is
+    denominated in the chain's own currency, so entry and price are always the
+    same kind of number and their ratio means what it says. Only the label
+    differs, and getting that wrong is how a 0.004 ETH buy reads as 0.004 SOL.
+    """
+    return ("ETH", 1e18) if ex(mint) is RH else ("SOL", 1e9)
+
+
+async def _token_unit(s, mint):
+    """Raw units per whole token. 6 on pump.fun, 18 on Robinhood, asked not
+    assumed -- a hardcoded 1e6 puts the Robinhood fill price out by 1e12."""
+    if ex(mint) is J:
+        return 1e6
+    d = await RH.decimals(s, mint)
+    return 10 ** (18 if d is None else d)
+
+
+async def _rh_exit_blocked(s, mint):
+    """Reason this Robinhood coin cannot be sold, or None if it can.
+
+    Asks for a sell quote of roughly what we would be holding. A missing exit
+    is the one failure the strategy has no answer for, so it is worth one call
+    before committing.
+    """
+    try:
+        taker = getattr(RH.WALLET, "address", None) or C.RH_ADDRESS
+        if not taker:
+            return "no rh wallet configured"
+        usd = await RH.eth_usd(s)
+        if not usd:
+            return None                  # can't tell; don't block on it
+        q, err = await RH.quote(s, RH.NATIVE, mint, int(RH.PROBE_USD / usd * 1e18), taker)
+        if err:
+            return f"buy will not route ({err})"
+        got = int(((q or {}).get("estimate") or {}).get("toAmount") or 0)
+        if got <= 0:
+            return "buy quote returned nothing"
+        _q, err = await RH.quote(s, mint, RH.NATIVE, got, taker)
+        return f"sell will not route ({err})" if err else None
+    except Exception as e:
+        return None                      # a checker outage must not block trading
+
+
+async def load_wallet(s, mint, wallet_id):
+    """The signer for one coin, of the kind its chain understands.
+
+    A Solana wallet cannot sign an EVM transaction, so loading the wrong class
+    would not fail until the swap was already half built.
+    """
+    if not wallet_id:
+        return None
+    cls = privy.PrivyEvmWallet if ex(mint) is RH else privy.PrivyWallet
+    return await cls.load(s, wallet_id)
+
+
+async def size_native(s, mint, size_sol):
+    """Order size in the coin's own currency, matched in dollars.
+
+    Settings are written in SOL. Robinhood chain spends ETH, and 0.1 of one is
+    not 0.1 of the other -- passing the number through unchanged would place a
+    $250 order where $15 was asked for. Returns None when either price is
+    unreadable, because guessing the size of a real order is not acceptable.
+    """
+    if ex(mint) is not RH:
+        return size_sol
+    sol, eth = await J.sol_usd(s), await RH.eth_usd(s)
+    if not sol or not eth:
+        return None
+    return size_sol * sol / eth
+
 
 LOG = "trades.jsonl"
 START_TS = time.time()
@@ -313,9 +406,9 @@ async def unarm(s, mint, source="you", user=None, final=False):
         try:
             pos = open_positions.get(k) or {}
             wid = pos.get("wallet_id")
-            w = (await J.privy.PrivyWallet.load(s, wid)
+            w = (await load_wallet(s, mint, wid)
                  if wid and not C.DRY_RUN else None)
-            held = await J.token_balance(s, mint, wallet=w)
+            held = await ex(mint).token_balance(s, mint, wallet=w)
         except Exception as e:
             print(f"DROP BALANCE CHECK {mint[:10]}…: {e}", flush=True)
 
@@ -327,7 +420,7 @@ async def unarm(s, mint, source="you", user=None, final=False):
                 break
             await asyncio.sleep(_DROP_RECHECK_SEC)
             try:
-                held = await J.token_balance(s, mint, wallet=w)
+                held = await ex(mint).token_balance(s, mint, wallet=w)
             except Exception as e:
                 print(f"DROP RECHECK {mint[:10]}: {e}", flush=True)
                 held = None
@@ -413,6 +506,19 @@ async def arm_mint(s, mint, user=None, wallet_id=None, fee_bps=None, opts=None, 
                          "of the feed. Tap a more recent signal.")
         return False
 
+    # Can we get OUT of it? On Robinhood a coin can quote a buy and refuse
+    # every sell -- CRUMBS' neighbour Charity does exactly that today. Buying
+    # one is buying a bag with no exit, and the stop would discover it only
+    # once the money was already in. Checked here, before anything is armed.
+    if ex(mint) is RH:
+        why = await _rh_exit_blocked(s, mint)
+        if why:
+            print(f"ARM-FAIL {mint[:12]}… {why}", flush=True)
+            await note(s, f"<b>{sig.get('symbol') or mint[:8]}</b> can be bought "
+                          f"but not sold right now — nothing routes an exit, so "
+                          f"the bot won't take a position it can't close.")
+            return False
+
     # The wallet to trade this with. None means the environment's own, which
     # is what a single-user run always uses.
     sig["user"] = user
@@ -482,16 +588,27 @@ async def poll_web_greenlights(s):
                                  timeout=aiohttp.ClientTimeout(total=15)) as r:
                     users = (await r.json()).get("users", []) if r.status == 200 else []
                 for u in users:
-                    if u.get("skip") or not u.get("wallet_id"):
+                    if u.get("skip"):
                         # No wallet means it cannot be traded. Say so once
                         # rather than dropping it silently, which is precisely
                         # how a second user's greenlight used to vanish.
                         print(f"greenlight for {str(u.get('identity'))[:18]}… "
-                              f"skipped: {u.get('skip') or 'no wallet'}", flush=True)
+                              f"skipped: {u.get('skip')}", flush=True)
                         continue
                     opts_by_mint = u.get("opts") or {}
                     for m in u.get("mints", []):
-                        pending.append((u["identity"], m, u["wallet_id"],
+                        # The coin's chain picks the wallet. Falling back to
+                        # the other chain's wallet would sign nothing at best,
+                        # and spend the wrong account at worst.
+                        wid = (u.get("evm_wallet_id") if ex(m) is RH
+                               else u.get("wallet_id"))
+                        if not wid:
+                            print(f"greenlight {m[:10]}… for "
+                                  f"{str(u.get('identity'))[:18]}… skipped: no "
+                                  f"{'Robinhood' if ex(m) is RH else 'Solana'} "
+                                  f"wallet on that account", flush=True)
+                            continue
+                        pending.append((u["identity"], m, wid,
                                         u.get("fee_bps"), opts_by_mint.get(m)))
             else:
                 async with s.get(f"{C.EDGE_API}/api/greenlights", headers=hdrs,
@@ -605,6 +722,9 @@ async def price_impact_pct(s, mint, size_sol):
     Comes back on the quote we would make anyway, so it costs nothing.
     """
     try:
+        X = ex(mint)
+        if X is not J:
+            return None      # LI.FI prices impact per route, not per quote
         q = await J.quote(s, J.WSOL, mint, int(size_sol * 1e9))
         v = q.get("priceImpactPct")
         return None if v is None else float(v) * 100
@@ -624,6 +744,26 @@ def fee_opts(cfg):
     }
 
 
+async def _dry_quote(s, frm, to, amount_raw, mint):
+    """One quote, in whichever shape the coin's chain answers with.
+
+    Jupiter returns the numbers directly; LI.FI wraps them and wants to know
+    who is asking. Normalising here keeps the dry-run path identical on both
+    chains, so DRY_RUN=1 rehearses the real thing rather than a Solana-shaped
+    approximation of it.
+    """
+    X = ex(mint)
+    if X is J:
+        return await J.quote(s, frm, to, amount_raw), None
+    taker = getattr(RH.WALLET, "address", None) or C.RH_ADDRESS
+    if not taker:
+        return None, "no_rh_wallet"
+    q, err = await RH.quote(s, frm, to, amount_raw, taker)
+    if err:
+        return None, err
+    return {"outAmount": ((q or {}).get("estimate") or {}).get("toAmount", 0)}, None
+
+
 async def dry_or_live_buy(s, mint, size_sol=None, fees=None, wallet=None):
     """Returns (tokens_received, sol_spent, fill_price, error)."""
     size_sol = C.SIZE_SOL if size_sol is None else size_sol
@@ -637,29 +777,76 @@ async def dry_or_live_buy(s, mint, size_sol=None, fees=None, wallet=None):
         # Both legs carry the fee now. On an ExactIn buy Jupiter takes it from
         # the INPUT mint, so it arrives as wSOL in the same account the sells
         # pay into — verified by on-chain simulation, not by the docs.
-        got, err, gas = await J.execute_buy(s, mint, size_sol, wallet=wallet, **(fees or {}))
+        size = await size_native(s, mint, size_sol)
+        if size is None:
+            return 0, 0.0, 0.0, "size_unconvertible"
+        X = ex(mint)
+        got, err, gas = await X.execute_buy(s, mint, size, wallet=wallet,
+                                            **(fees or {}))
+        # Robinhood books are thin and the ceiling moves minute to minute:
+        # three of ten board coins refuse $25 but fill $10. execute_buy answers
+        # with the size that WOULD have worked, so take it rather than skipping
+        # the entry entirely -- a smaller fill is a worse trade, no fill is no
+        # trade at all. Announced by the caller, never silent.
+        if err and str(err).startswith("size_too_large:max_eth="):
+            try:
+                cap = float(str(err).split("=", 1)[1]) * 0.97   # room to move
+            except (ValueError, IndexError):
+                cap = 0.0
+            if cap > 0:
+                print(f"RH SIZE TRIM {mint[:10]}…: {size:.5f} -> {cap:.5f} ETH",
+                      flush=True)
+                got, err, gas = await X.execute_buy(s, mint, cap, wallet=wallet,
+                                                    **(fees or {}))
+                if not err:
+                    size = cap
         if err or got <= 0:
             return 0, 0.0, 0.0, err or "swap_failed"
         # What the chain charged, not what we guessed it might. Falls back to the
         # estimate only when the transaction could not be read.
-        cost = size_sol + (C.GAS_SOL if gas is None else gas)
-        return got, cost, cost / (got / 1e6), None
+        # What the chain charged, not what we guessed it might. Falls back to
+        # the estimate only when the transaction could not be read. `size`, not
+        # `size_sol`: on Robinhood they are different currencies, and after a
+        # trim they are different amounts too.
+        est_gas = C.GAS_SOL if ex(mint) is J else C.RH_GAS_ETH
+        cost = size + (est_gas if gas is None else gas)
+        return got, cost, cost / (got / await _token_unit(s, mint)), None
 
-    q = await J.quote(s, J.WSOL, mint, int(size_sol * 1e9))
-    got = int(q.get("outAmount", 0) or 0)
+    size = await size_native(s, mint, size_sol)
+    if size is None:
+        return 0, 0.0, 0.0, "size_unconvertible"
+    _n, per = await _unit(s, mint)
+    q, qerr = await _dry_quote(s, _native(mint), mint, int(size * per), mint)
+    got = 0 if qerr else int((q or {}).get("outAmount", 0) or 0)
+    if got <= 0 and ex(mint) is RH:
+        # Same trim the live path takes, so a dry run rehearses the trade that
+        # would actually happen rather than reporting a refusal the live bot
+        # would have worked around.
+        taker = getattr(RH.WALLET, "address", None) or C.RH_ADDRESS
+        cap = (await RH.max_routable_buy(s, mint, taker, size)) * 0.97 if taker else 0.0
+        if cap > 0:
+            q, qerr = await _dry_quote(s, _native(mint), mint, int(cap * per), mint)
+            got = 0 if qerr else int((q or {}).get("outAmount", 0) or 0)
+            if got > 0:
+                print(f"RH SIZE TRIM (dry) {mint[:10]}…: "
+                      f"{size:.5f} -> {cap:.5f} ETH", flush=True)
+                size = cap
     if got <= 0:
         return 0, 0.0, 0.0, "no_route"
-    cost = size_sol + C.GAS_SOL            # gas is real money in dry run too
-    return got, cost, cost / (got / 1e6), None
+    # gas is real money in dry run too
+    cost = size + (C.GAS_SOL if ex(mint) is J else C.RH_GAS_ETH)
+    return got, cost, cost / (got / await _token_unit(s, mint)), None
 
 
-async def _sweep_wrapped(s, wallet, name):
+async def _sweep_wrapped(s, wallet, name, mint=None):
     """Return anything Jupiter left wrapped to spendable SOL.
 
     Called after a sell because that is when it appears. Failure is logged and
     swallowed: the money is safe either way, it is simply in the wrong form,
     and this must never be able to affect the trade that just completed.
     """
+    if mint is not None and ex(mint) is not J:
+        return              # nothing wraps on Robinhood; there is nothing to sweep
     try:
         got, err = await J.unwrap_wsol(s, wallet=wallet)
         if err:
@@ -677,16 +864,19 @@ async def dry_or_live_sell(s, mint, raw_amount, fees=None, wallet=None):
         return 0.0, "nothing_to_sell"
 
     if not C.DRY_RUN:
-        out, err, gas = await J.execute_sell(s, mint, raw_amount, wallet=wallet, **(fees or {}))
+        out, err, gas = await ex(mint).execute_sell(s, mint, raw_amount,
+                                                    wallet=wallet, **(fees or {}))
         if err:
             return 0.0, err
-        return max(0.0, out - (C.GAS_SOL if gas is None else gas)), None
+        est_gas = C.GAS_SOL if ex(mint) is J else C.RH_GAS_ETH
+        return max(0.0, out - (est_gas if gas is None else gas)), None
 
-    q = await J.quote(s, mint, J.WSOL, int(raw_amount))
-    out = int(q.get("outAmount", 0) or 0)
+    q, qerr = await _dry_quote(s, mint, _native(mint), int(raw_amount), mint)
+    out = 0 if qerr else int((q or {}).get("outAmount", 0) or 0)
     if out <= 0:
         return 0.0, "no_route"
-    return max(0.0, out / 1e9 - C.GAS_SOL), None
+    name, per = await _unit(s, mint)
+    return max(0.0, out / per - (C.GAS_SOL if per == 1e9 else C.RH_GAS_ETH)), None
 
 
 # ── working a single coin ───────────────────────────────────────────────────
@@ -729,7 +919,7 @@ async def work_coin(s, sig, resume=None):
     wallet = None
     if wallet_id and not C.DRY_RUN:
         try:
-            wallet = await J.privy.PrivyWallet.load(s, wallet_id)
+            wallet = await load_wallet(s, mint, wallet_id)
         except Exception as e:
             print(f"ARM-FAIL {name}: could not load wallet {wallet_id[:10]}…: {e}",
                   flush=True)
@@ -799,7 +989,7 @@ async def work_coin(s, sig, resume=None):
     if resume:
         # Resumed positions hold real money exactly like fresh ones; without
         # this, a restart would silently drop them back into the slow lane.
-        J.hold(mint)
+        ex(mint).hold(mint)
         sess.state = "POS"
         sess.entry = float(resume.get("entry_px") or 0) or None
         sess.ppeak = float(resume.get("ppeak") or 0) or sess.entry
@@ -910,7 +1100,7 @@ async def work_coin(s, sig, resume=None):
                     # terminal. Read what they actually fetched rather than
                     # recording a stop that fired into an empty wallet.
                     try:
-                        got, _ = await J.exit_proceeds(s, mint, since=int(t0))
+                        got, _ = await ex(mint).exit_proceeds(s, mint, since=int(t0))
                     except Exception as e:
                         print(f"EXIT LOOKUP FAILED {name}: {e}", flush=True)
                         got = None
@@ -941,14 +1131,14 @@ async def work_coin(s, sig, resume=None):
                 break
             if sess.state == "POS" and elapsed > max_hold:
                 got, err = await dry_or_live_sell(s, mint, tokens_held, fees, wallet=wallet)
-                await _sweep_wrapped(s, wallet, name)
+                await _sweep_wrapped(s, wallet, name, mint)
                 if not err:
                     received += got
                     tokens_held = 0
                 await note(s, f"⌛ <b>{name}</b> — max hold reached, closed out.")
                 break
 
-            price = await J.get_price(s, mint)
+            price = await ex(mint).get_price(s, mint)
 
             # A dead price feed is indistinguishable from a quiet coin: the
             # strategy just never sees a dip and waits out the clock. Say so
@@ -987,7 +1177,7 @@ async def work_coin(s, sig, resume=None):
                 # so it does not wobble, and our figures stop depending on when
                 # GMGN last refreshed. Frozen once in a position so entry, the
                 # rungs and the live cap stay a consistent set.
-                scale = await J.mc_scale(s, mint, supply=_supply_from_row(sig))
+                scale = await ex(mint).mc_scale(s, mint, supply=_supply_from_row(sig))
                 if scale and not factor_locked:
                     mc_factor = scale
                 if scale or fresh:
@@ -1100,7 +1290,7 @@ async def work_coin(s, sig, resume=None):
                     # from supply and the SOL price rather than borrowed. This
                     # is the number GMGN's trade row shows, because it carries
                     # our own price impact rather than quoting spot beside it.
-                    scale = await J.mc_scale(s, mint, supply=_supply_from_row(sig))
+                    scale = await ex(mint).mc_scale(s, mint, supply=_supply_from_row(sig))
                     if scale:
                         mc_factor = scale
                     if fill_px and mc_factor:
@@ -1115,7 +1305,7 @@ async def work_coin(s, sig, resume=None):
                     tokens_original = got        # the ladder is fractions of THIS
                     # From here this coin's price is a stop check, not one feed
                     # among many. It goes to the front of the Jupiter queue.
-                    J.hold(mint)
+                    ex(mint).hold(mint)
                     sess.on_filled(fill_px)
                     open_positions[k] = {"name": name, "tokens_raw": tokens_held,
                                             "entry_px": fill_px, "spent_sol": spent,
@@ -1182,7 +1372,7 @@ async def work_coin(s, sig, resume=None):
                         # being a take-profit.
                         tp_fees["slippage_bps"] = min(base * (1 + tp_tries), 2500)
                     got, err = await dry_or_live_sell(s, mint, amount, tp_fees, wallet=wallet)
-                    await _sweep_wrapped(s, wallet, name)
+                    await _sweep_wrapped(s, wallet, name, mint)
                     if err:
                         # The same hole the stop path already closed, left open
                         # here. A sell can fail because there is nothing left to
@@ -1195,7 +1385,7 @@ async def work_coin(s, sig, resume=None):
                         # reads the real proceeds off chain and journals them.
                         if _looks_empty(err):
                             try:
-                                left = await J.token_balance(s, mint, wallet=wallet)
+                                left = await ex(mint).token_balance(s, mint, wallet=wallet)
                             except Exception:
                                 left = None
                             if left == 0:
@@ -1278,7 +1468,7 @@ async def work_coin(s, sig, resume=None):
                         sell_fees["slippage_bps"] = min(base * (1 + stop_tries), 2500)
                     got, err = await dry_or_live_sell(s, mint, tokens_held, sell_fees,
                                                       wallet=wallet)
-                    await _sweep_wrapped(s, wallet, name)
+                    await _sweep_wrapped(s, wallet, name, mint)
                     if err:
                         # Deliberately NOT closing here. The sell reverted, so
                         # the tokens are still ours; closing left a bag with no
@@ -1294,7 +1484,7 @@ async def work_coin(s, sig, resume=None):
                         # proceeds off chain and journals them.
                         if _looks_empty(err):
                             try:
-                                left = await J.token_balance(s, mint, wallet=wallet)
+                                left = await ex(mint).token_balance(s, mint, wallet=wallet)
                             except Exception:
                                 left = None
                             if left == 0:
@@ -1371,7 +1561,7 @@ async def work_coin(s, sig, resume=None):
         # held forever, and every later coin would queue behind a position
         # that no longer exists.
         if not any(kk != k and kk.endswith(mint) for kk in open_positions):
-            J.release(mint)
+            ex(mint).release(mint)
         live_sessions.pop(k, None)
         # Only forget the position if we're actually flat. The orphan guard
         # above may have just recorded one on purpose.
@@ -1601,12 +1791,12 @@ async def main():
                 w = None
                 if wid and not C.DRY_RUN:
                     try:
-                        w = await J.privy.PrivyWallet.load(http, wid)
+                        w = await load_wallet(http, mint_only, wid)
                     except Exception as e:
                         print(f"reconcile: could not load wallet {str(wid)[:10]}… "
                               f"({e}) — leaving {mint_only[:8]} open", flush=True)
                         return None
-                return await J.token_balance(http, mint_only, wallet=w)
+                return await ex(mint_only).token_balance(http, mint_only, wallet=w)
 
             notes, closed = await S.reconcile(s, watched, _pos_balance)
             # reconcile pops from the dict it was handed, which is a subset.
@@ -1654,7 +1844,7 @@ async def main():
                 else:
                     pos_user, mint = None, pkey
                 try:
-                    got, _ = await J.exit_proceeds(
+                    got, _ = await ex(mint).exit_proceeds(
                         s, mint, since=int(pos.get("opened") or 0))
                 except Exception as e:
                     print(f"EXIT LOOKUP FAILED {mint[:12]}…: {e}", flush=True)
